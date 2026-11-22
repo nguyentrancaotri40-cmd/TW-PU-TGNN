@@ -1,0 +1,103 @@
+# configs/base.yaml -- shared settings. Overlay a delay file on top of it:
+#   python scripts/prepare_data.py --config configs/base.yaml --delay_config configs/delay_low.yaml
+# Keys marked "round 5" are placeholders for the model/trainer and are not read yet.
+
+seed: 42
+seeds: [42, 43, 44]            # 3 seeds -> 95% CI against the naive baseline A0
+
+paths:
+  data_dir: data               # folder with train_transaction.csv / train_identity.csv
+  processed_dir: data/processed
+  results_dir: results
+  checkpoints_dir: checkpoints
+
+split:                         # temporal split over the time span, day-aligned
+  train_ratio: 0.65
+  val_ratio: 0.16
+  test_ratio: 0.19
+  by: time                     # time | count
+  snap_to_day: true
+
+# Top-level features (read by load_phase_datasets(features_cfg=...), NOT graph.features).
+features:
+  lp_features:
+    enabled: false       # true -> model_in_dim = feature_dim + 4 (461)
+    maturity_window_days: null
+    negative_rule: maturity_window
+    log1p_counts: true
+
+graph:
+  # ASSUMPTION: IEEE-CIS has no true card/device id. Each entity is a PROXY key built
+  # from several columns (card1..card6; DeviceInfo+id_30+id_31).
+  # A row gets an edge only if every column in required_cols is non-null.
+  # max_degree = super-node cap, FITTED ON THE TRAIN PERIOD ONLY: an entity with more
+  # than max_degree train transactions is removed everywhere (its edges are dropped).
+  # EMAIL IS NO LONGER AN ENTITY: a purchaser-email domain is a low-cardinality attribute
+  # (a few dozen values), so every domain exceeded max_degree and 98.2% of train edges were
+  # removed. It is now a feature block of the transaction node (see features.email).
+  entities:
+    card:
+      key_cols: [card1, card2, card3, card4, card5, card6]
+      required_cols: [card1]
+      max_degree: 2000
+    device:
+      key_cols: [DeviceInfo, id_30, id_31]
+      required_cols: [DeviceInfo]
+      max_degree: 2000
+  features:
+    # Transaction-node features: numeric columns (V*, C*, D*, TransactionAmt, id_01..)
+    # except numeric_exclude, median-imputed and z-scored with TRAIN statistics, plus
+    # one-hot of the low-cardinality columns in onehot_cols (top max_categories on train).
+    onehot_cols: [ProductCD, card4, card6, M1, M2, M3, M4, M5, M6, M7, M8, M9]
+    numeric_exclude: [card1, addr1, addr2]   # id-like codes: not meaningful as numbers
+    max_categories: 30
+    # NEW: numeric columns whose TRAIN missing ratio is > max_missing_ratio are dropped
+    # before imputation / scaling. null disables the filter. 0.9 is a starting value,
+    # not a tuned one: the encoder prints which columns were dropped.
+    max_missing_ratio: 0.9
+    clip_z: 10.0
+    add_missing_ratio: true
+    # NEW: email as transaction features (statistics fitted on TRAIN only).
+    email:
+      cols: [P_emaildomain]      # add R_emaildomain here if you want the recipient too
+      top_k: 10                  # one-hot of the 10 most frequent TRAIN domains (+ other, + missing)
+      add_frequency: true        # relative frequency of the domain in TRAIN (unseen -> 0.0)
+
+sampler:
+  num_neighbors: [15, 10]      # per hop. NOTE: a transaction has <= 1 neighbour per entity
+                               # type in hop 1, so the effective fan-out is ~[1, 10].
+  batch_size: 1024
+  eval_batch_size: 2048
+  temporal_strategy: uniform   # uniform | last (most recent neighbours first)
+  strict_time: true            # neighbours must be STRICTLY earlier than the seed
+  num_workers: 0               # >0 only after checking pyg-lib + fork on your machine
+
+model:
+  backbone: sage         # sage (main, 72 runs) | gat (secondary check only)
+  hidden_dim: 128
+  num_layers: 2
+  dropout: 0.2
+  entity_embedding_dim: 32
+  gat_heads: 4           # GAT only; hidden_dim must be divisible by it
+  max_history: 20        # most recent history transactions fed to the GRU per seed
+  gru_layers: 1
+  use_temporal: true     # false -> SAGEConv/GATConv + MLP ablation
+
+train:
+  lr: 0.001
+  weight_decay: 0.00001
+  epochs: 30
+  patience: 5
+  warmup_epochs: 1       # linear LR warm-up per step; early-stopping patience starts after it
+  min_delta: 0.0
+  monitor: pr_auc        # pr_auc | roc_auc | recall_at_fpr (VALIDATION)
+  grad_clip: 1.0         # null disables
+
+eval:
+  fpr: 0.01              # operating point: threshold chosen on VAL so that FPR <= 1%
+  review_cost: 0.0       # EFL = missed fraud amount + review_cost * #FP. 0 = no explicit FP cost (KHÔNG CHẮC)
+
+loss:
+  name: naive_bce        # naive_bce | maturity_mask | delay_ipw | tw_nndf
+  delay_ipw: {lam: 0.23} # ln2 / median_delay_days, to be swept (KHÔNG CHẮC if it is the right scale)
+  tw_nndf: {unlabeled_statuses: [U]}

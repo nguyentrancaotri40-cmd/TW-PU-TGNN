@@ -1,0 +1,94 @@
+# ============================================================
+# TW-PU-TGNN / DelayGraphBench  -  .gitignore
+# Goal: Không đẩy file dữ liệu nặng, model, log, hoặc môi trường ảo lên GitHub.
+# Vẫn giữ lại các file kết quả (.csv) để dễ dàng lấy số liệu về máy.
+# ============================================================
+
+# ---------- Dữ liệu thô & file đồ thị nặng ----------
+# Bỏ qua nội dung thư mục data/ nhưng giữ lại cấu trúc thư mục
+data/*
+!data/.gitkeep
+!data/README.md
+
+# Các file CSV gốc của Kaggle (nếu có lỡ để trong thư mục dự án)
+train_transaction.csv
+train_identity.csv
+test_transaction.csv
+test_identity.csv
+sample_submission.csv
+
+# ---------- Các file nhị phân nặng (Tensor, Model, Nén) ----------
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.npz
+*.npy
+*.pkl
+*.pickle
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
+# ---------- Kết quả sinh ra trong quá trình chạy ----------
+# Bỏ qua nội dung thư mục results/
+results/*
+!results/.gitkeep
+
+# NHƯNG VẪN GIỮ LẠI các file CSV kết quả để tải về máy
+!results/*.csv
+!results/**/*.csv
+
+# Không đẩy hình ảnh, log, và file chạy thử
+results/analysis/*.png
+results/analysis/*.pdf
+results/runs/
+results/smoke/
+results/profile/
+*.log
+
+# Các output đặc thù của Kaggle (nếu có)
+figures/
+analysis/
+report_bundle.zip
+
+# ---------- Python Cache & Test ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---------- Môi trường ảo (Virtual Environments) ----------
+venv/
+.venv/
+env/
+ENV/
+
+# ---------- Jupyter Notebook Checkpoints ----------
+.ipynb_checkpoints/
+
+# ---------- Secrets (Tuyệt đối không đẩy lên) ----------
+.env
+.env.*
+kaggle.json
+*.token
+secrets.*
+
+# ---------- Editor / OS ----------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
