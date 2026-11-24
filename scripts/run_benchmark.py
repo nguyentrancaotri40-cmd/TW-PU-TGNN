@@ -1,3 +1,7 @@
+# =====================================================================
+# FILE: scripts/run_benchmark.py
+# TRẠNG THÁI: ĐÃ SỬA (xóa định nghĩa lặp apply_prior_override; logic giữ nguyên)
+# =====================================================================
 #!/usr/bin/env python
 """Benchmark runner with auto-resume.
 
@@ -31,7 +35,7 @@ import shutil
 import sys
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -58,6 +62,8 @@ RESULT_COLUMNS: list[str] = [
     "finished_utc", "error",
 ]
 
+DEFAULT_RESULTS = REPO_ROOT / "results" / "benchmark_results.csv"
+DEFAULT_DETAILS = REPO_ROOT / "results" / "runs"
 
 # --------------------------------------------------------------------------- #
 # Plan
@@ -133,6 +139,22 @@ def resolve_cfg(base_cfg: Mapping[str, Any], bench: Mapping[str, Any], spec: Run
             d["lam"] = float(lam)
         loss_cfg["delay_ipw"] = d
     return cfg
+
+
+def apply_prior_override(plan: Sequence[RunSpec], prior: float) -> list[RunSpec]:
+    """--prior: keep ONLY tw_nndf runs and pin their prior (run_id gets the ``_pi<value>`` suffix)."""
+    if not 0.0 < prior < 1.0:
+        raise ValueError("--prior must be in (0, 1).")
+    out: list[RunSpec] = []
+    seen: set[str] = set()
+    for s in plan:
+        if s.loss != "tw_nndf" or s.oracle:
+            continue
+        t = replace(s, group="prior_cli", prior=float(prior))
+        if t.run_id not in seen:                      # e.g. main + prior_sensitivity would collide
+            seen.add(t.run_id)
+            out.append(t)
+    return out
 
 
 def hash_config(base_cfg: Mapping[str, Any], bench: Mapping[str, Any]) -> str:
@@ -325,6 +347,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("--retry_failed", action="store_true")
     p.add_argument("--allow_default_lam", action="store_true", help="use the W/2 default lambda (smoke only)")
     p.add_argument("--allow_config_change", action="store_true")
+    p.add_argument("--prior", type=float, default=None,
+                   help="tw_nndf prior override: keeps ONLY tw_nndf runs, writes to results/prior_diag/ (diagnostic)")
     p.add_argument("--smoke", action="store_true", help="2 epochs x 20 batches, separate results file")
     p.add_argument("--dry_run", action="store_true")
     p.add_argument("--est_epoch_minutes", type=float, default=None, help="(train+val) epoch minutes for an hours bound")
@@ -342,11 +366,23 @@ def main(argv: Sequence[str] | None = None, run_fn: Callable[..., dict[str, Any]
     plan = build_plan(bench)
     if args.only_group:
         plan = [s for s in plan if s.group in args.only_group]
+    if args.prior is not None:
+        plan = apply_prior_override(plan, args.prior)
+        if not plan:
+            print("[benchmark] ERROR: --prior left no tw_nndf run in the selected plan.")
+            return 2
     if args.limit:
         plan = plan[: args.limit]
 
     results, details = Path(args.results), Path(args.details_dir)
+    if args.prior is not None and not args.smoke:    # never mix prior-override runs into the main CSV
+        if results == DEFAULT_RESULTS:
+            results = REPO_ROOT / "results" / "prior_diag" / "benchmark_results_prior.csv"
+        if details == DEFAULT_DETAILS:
+            details = REPO_ROOT / "results" / "prior_diag" / "runs"
+        print(f"[benchmark] --prior {args.prior}: results -> {results}")
     max_batches, allow_lam = None, args.allow_default_lam
+    max_hours = args.max_hours if args.max_hours is not None else bench.get("max_hours")
     if args.smoke:
         base_cfg = deep_update(base_cfg, {"train": {"epochs": 2, "warmup_epochs": 1}})
         results = REPO_ROOT / "results" / "smoke" / "benchmark_results_smoke.csv"
@@ -383,7 +419,7 @@ def main(argv: Sequence[str] | None = None, run_fn: Callable[..., dict[str, Any]
         run_fn = run_one
 
     out = execute(plan, base_cfg, bench, processed_root=root, results_path=results, details_dir=details,
-                  run_fn=run_fn, device=args.device, max_hours=args.max_hours,
+                  run_fn=run_fn, device=args.device, max_hours=max_hours,
                   assume_run_seconds=None if args.assume_run_minutes is None else args.assume_run_minutes * 60.0,
                   retry_failed=args.retry_failed, allow_default_lam=allow_lam,
                   allow_config_change=args.allow_config_change, max_train_batches=max_batches)

@@ -22,9 +22,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from src.losses.calibration import (
+    MatureTemperatureTracker, SlidingWindowPrior, sliding_window_prior, unlabeled_prior, young_counts,
+)
+from src.losses.maturity_mask import MaturityMaskLoss
+from src.losses.tw_nndf import HybridTWnnDFLoss, TimeWindowNNDFLoss, estimate_class_prior
+from src.losses.tw_nndf import HybridTWnnDFLoss
 from src.data.dataset import load_phase_datasets, read_meta, seed_labels
 from src.eval import metrics as M
 from src.graph.builder import PNU_CODES, TXN
+from src.losses.tw_nndf import HybridTWnnDFLoss, TimeWindowNNDFLoss
 from src.losses import (
     NaiveBCELoss, TimeWindowNNDFLoss, build_loss, compute_age_days, estimate_class_prior,
     lam_from_median_delay,
@@ -38,8 +45,9 @@ from src.train.utils import (
 
 LOSS_NAMES = ("naive_bce", "maturity_mask", "delay_ipw", "tw_nndf")
 MONITORS = ("pr_auc", "roc_auc", "recall_at_fpr")
-NNDF_KEYS = ("pos_risk", "neg_risk_raw", "clamped")
-
+NNDF_KEYS = ("pos_risk", "neg_risk_raw", "clamped", "ascent", "bce")
+PRIOR_MODES = ("mature_mean", "sliding_window", "sliding_unlabeled", "sliding_dynamic")
+AMOUNT_KEYS = ("amount_aware", "amount_quantile", "amount_min_age_days")
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -101,15 +109,21 @@ class TrainConfig:
 # --------------------------------------------------------------------------- #
 # Loss construction (+ prior / delay diagnostics for the log)
 # --------------------------------------------------------------------------- #
+
 def build_training_loss(cfg: TrainConfig, train_ds: Any, meta: Mapping[str, Any]) -> tuple[nn.Module, dict[str, Any]]:
-    """Return ``(loss module, info dict)``. ``info`` is stored with every run for the prior analysis."""
+    """Return ``(loss module, info dict)``. ``info`` is stored with every run for the prior analysis.
+
+    Only ``train_ds`` is given: no validation / test statistic can reach a loss through this function. The p95
+    amount, mean amount and every prior come from the TRAIN graph (train-view rows) only.
+    """
     if cfg.oracle:
         return NaiveBCELoss(), {"loss": "naive_bce", "oracle": True}
-
     full = train_ds.data[TXN]
     label_cut = float(train_ds.data.label_cut)
     window = float(meta["config"]["delay"]["maturity_window_days"])
     in_u = (full.pnu == PNU_CODES["U"]) & full.in_train_view
+    age_all = compute_age_days(full.time, label_cut)
+    amt_view = full.amount[full.in_train_view].float()  # TRAIN graph, train-view rows only
     info: dict[str, Any] = {
         "loss": cfg.loss, "oracle": False, "maturity_window_days": window,
         "n_P": int((full.pnu == PNU_CODES["P"]).sum()), "n_N": int((full.pnu == PNU_CODES["N"]).sum()),
@@ -119,14 +133,85 @@ def build_training_loss(cfg: TrainConfig, train_ds: Any, meta: Mapping[str, Any]
     }
     params = dict(cfg.loss_params)
 
+    def amount_rule(aw: Mapping[str, Any]) -> tuple[float | None, float]:
+        """Window + Amount-Aware rule shared by maturity_mask and tw_nndf: ``(p95_train or None, min_age)``."""
+        if not bool(aw.get("amount_aware", False)):
+            return None, 0.0
+        q = float(aw.get("amount_quantile", 0.95))
+        if not 0.0 < q < 1.0:
+            raise ValueError("amount_quantile must be in (0, 1).")
+        if amt_view.numel() == 0:
+            raise ValueError("No train-view rows: cannot compute the amount quantile.")
+        thr = float(torch.quantile(amt_view, q))  # TRAIN amounts only
+        mn = aw.get("amount_min_age_days")
+        min_age = window / 2.0 if mn is None else float(mn)  # default W/2 = design choice (Threats to Validity)
+        trusted = in_u & (full.amount >= thr) & (age_all >= min_age)
+        info.update(
+            amount_aware=True, amount_quantile=q, amount_threshold=thr, amount_min_age_days=min_age,
+            n_U_trusted=int(trusted.sum()),
+            # DIAGNOSTIC ONLY (reads y_true: share of hidden fraud among the U rows treated as negatives)
+            diag_true_fraud_rate_in_trusted_U=(
+                float(full.y_true[trusted].float().mean()) if bool(trusted.any()) else None),
+        )
+        return thr, min_age
+
+    if cfg.loss == "maturity_mask":
+        thr, min_age = amount_rule({k: params.pop(k) for k in AMOUNT_KEYS if k in params})
+        if thr is not None:
+            params.update(amount_threshold=thr, amount_min_age_days=min_age)
+        return MaturityMaskLoss(**params), info
+
     if cfg.loss == "tw_nndf":
-        age_all = compute_age_days(full.time, label_cut)
-        est = estimate_class_prior(full.y_obs, age_all, window, full.in_train_view)  # observed labels only
-        prior = cfg.prior if cfg.prior is not None else est
-        info.update(prior=prior, prior_estimated=est, prior_source="config" if cfg.prior is not None else "estimated")
+        prior_mode = str(params.pop("prior_mode", "mature_mean"))
+        span_days = float(params.pop("prior_span_days", 14.0))
+        n_windows = int(params.pop("prior_n_windows", 3))
+        shrink = float(params.pop("prior_shrink", 200.0))
+        variant = str(params.pop("variant", "pu_only"))
+        lambda_pu = float(params.pop("lambda_pu", 1.0))
+        calib_cfg = dict(params.pop("calibration", None) or {})
+        aw = {k: params.pop(k) for k in AMOUNT_KEYS if k in params}
+        if prior_mode not in PRIOR_MODES:
+            raise ValueError(f"prior_mode must be one of {PRIOR_MODES}.")
+        if variant not in ("pu_only", "hybrid"):
+            raise ValueError("loss.tw_nndf.variant must be 'pu_only' or 'hybrid'.")
         if "unlabeled_statuses" in params:
             params["unlabeled_statuses"] = tuple(params["unlabeled_statuses"])
-        return TimeWindowNNDFLoss(prior=prior, **params), info
+
+        est = estimate_class_prior(full.y_obs, age_all, window, full.in_train_view)  # observed labels only
+        prior_auto = est
+        info.update(prior_estimated=est)
+        if prior_mode != "mature_mean":
+            sw = sliding_window_prior(full.y_obs, age_all, window, in_train_view=full.in_train_view,
+                                      span_days=span_days, n_windows=n_windows)
+            prior_auto = sw.prior  # sliding_dynamic uses it as the fallback scalar
+            info.update(prior_sliding=sw.prior, prior_window_rates=list(sw.window_rates),
+                        prior_window_counts=list(sw.window_counts))
+            if prior_mode == "sliding_unlabeled":
+                if tuple(params.get("unlabeled_statuses", ("U",))) != ("U",):
+                    raise ValueError("prior_mode='sliding_unlabeled' needs unlabeled_statuses == ['U'].")
+                n_p, n_u = young_counts(full.pnu, age_all, window, full.in_train_view)
+                prior_auto = unlabeled_prior(sw.prior, n_p, n_u)
+                info.update(n_P_young=n_p, n_U_young=n_u)
+        prior = cfg.prior if cfg.prior is not None else prior_auto
+        source = "config" if cfg.prior is not None else ("estimated" if prior_mode == "mature_mean" else prior_mode)
+        info.update(prior=prior, prior_mode=prior_mode, prior_source=source, variant=variant)
+        if bool(params.get("amount_weighted", False)):
+            params["amount_ref"] = float(amt_view.mean())  # mean TRAIN amount
+            info.update(amount_weighted=True, amount_ref=params["amount_ref"])
+
+        if variant == "pu_only":  # V1 / V1.5 behaviour: hybrid-only keys were popped above and are ignored
+            return TimeWindowNNDFLoss(prior=prior, **params), info
+
+        thr, min_age = amount_rule(aw)
+        sp = None
+        if prior_mode == "sliding_dynamic" and cfg.prior is None:  # --prior override pins a fixed pi
+            sp = SlidingWindowPrior.fit(full.y_obs, age_all, window, full.in_train_view,
+                                        span_days=span_days, shrink=shrink)
+            info.update(prior_dynamic_min=float(sp.table.min()), prior_dynamic_max=float(sp.table.max()))
+        tracker = MatureTemperatureTracker(**calib_cfg) if bool(calib_cfg.pop("enabled", True)) else None
+        info.update(lambda_pu=lambda_pu, calibration=tracker is not None)
+        return HybridTWnnDFLoss(prior=prior, lambda_pu=lambda_pu, amount_threshold=thr,
+                                amount_min_age_days=min_age, calibrator=tracker, sliding_prior=sp, **params), info
 
     if cfg.loss == "delay_ipw":
         lam = params.pop("lam", None)
@@ -136,6 +221,28 @@ def build_training_loss(cfg: TrainConfig, train_ds: Any, meta: Mapping[str, Any]
         return DelayIPWLoss(lam=lam, **params), info
 
     return build_loss(cfg.loss, **params), info
+
+
+def compute_batch_loss(
+    model: nn.Module, loss_fn: nn.Module, batch: Any, label_cut: float, oracle: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Forward + loss on the seed rows of one batch (shared with scripts/profile_epoch.py)."""
+    labels = seed_labels(batch)
+    if oracle:
+        if "y_true" not in labels:
+            raise KeyError("Oracle run needs y_true in the train batches (expose_train_true_labels=True).")
+        y = labels["y_true"]
+    else:
+        y = labels["y_obs"]
+    age = compute_age_days(labels["time"], label_cut)
+    kwargs: dict[str, Any] = {"age_days": age, "in_train_view": labels["in_train_view"]}
+    if getattr(loss_fn, "needs_amount", False):  # amount-aware masking / cost-sensitive nnDF only
+        if "amount" not in labels:
+            raise KeyError("This loss needs `amount` in the batches.")
+        kwargs["amount"] = labels["amount"]
+    logits = model(batch)
+    loss = loss_fn(logits, y, labels["pnu"], **kwargs)
+    return loss, logits
 
 
 # --------------------------------------------------------------------------- #
@@ -154,7 +261,8 @@ def compute_batch_loss(
         y = labels["y_obs"]
     age = compute_age_days(labels["time"], label_cut)
     logits = model(batch)
-    loss = loss_fn(logits, y, labels["pnu"], age_days=age, in_train_view=labels["in_train_view"])
+    extra = {"amount": labels["amount"]} if getattr(loss_fn, "needs_amount", False) else {}
+    loss = loss_fn(logits, y, labels["pnu"], age_days=age, in_train_view=labels["in_train_view"], **extra)
     return loss, logits
 
 
@@ -233,7 +341,7 @@ class Trainer:
             n_used += 1
             if self._is_nndf:  # tensors accumulated on device: no GPU sync per step
                 for k in NNDF_KEYS:
-                    risk_sum[k] += self.loss_fn.last_risks[k].to(dev)
+                    risk_sum[k] += self.loss_fn.last_risks.get(k, loss_sum.new_zeros(())).to(dev)  # pu_only has no "bce"
         elapsed = sw.stop()
 
         denom = max(n_used, 1)
@@ -245,7 +353,9 @@ class Trainer:
         if self._is_nndf:
             out.update({"nndf_pos_risk": float(risk_sum["pos_risk"]) / denom,
                         "nndf_neg_risk_raw": float(risk_sum["neg_risk_raw"]) / denom,
-                        "nndf_clamped_rate": float(risk_sum["clamped"]) / denom})
+                        "nndf_clamped_rate": float(risk_sum["clamped"]) / denom,
+                        "nndf_bce": float(risk_sum["bce"]) / denom,
+                        "nndf_ascent_rate": float(risk_sum["ascent"]) / denom})
         return out
 
     # ---- evaluation ---------------------------------------------------------- #
@@ -272,6 +382,14 @@ class Trainer:
 
         for epoch in range(1, cfg.epochs + 1):
             tr = self.train_epoch()
+            end = getattr(self.loss_fn, "end_epoch", None)      # HybridTWnnDFLoss only: refit T on TRAIN rows
+            if end is not None:
+                t_new = end()
+                if t_new is not None:
+                    tr["calib_T"] = float(t_new)                 # shown as T= in the epoch log
+                    cal = getattr(self.loss_fn, "calibrator", None)
+                    if cal is not None and cal.last_raw_temperature is not None:
+                        tr["calib_T_raw"] = float(cal.last_raw_temperature)   # pre-clamp value
             va, _ = self.evaluate(self.val_ds)
             improved = stopper.update(va[cfg.monitor], epoch)
             if improved:
@@ -283,6 +401,7 @@ class Trainer:
             history.append({"epoch": float(epoch), **tr, "val_pr_auc": va["pr_auc"],
                             "val_roc_auc": va["roc_auc"], "val_recall_at_fpr": va["recall_at_fpr"]})
             extra = (f" | nndf neg_raw={tr['nndf_neg_risk_raw']:+.4f} clamped={tr['nndf_clamped_rate']:.2f}"
+                     f" ascent={tr['nndf_ascent_rate']:.2f} bce={tr['nndf_bce']:.4f} T={tr.get('calib_T', float('nan')):.3f}"
                      f" empty={int(tr['n_empty_batches'])}") if self._is_nndf else ""
             self.log(f"epoch {epoch:>2} loss={tr['train_loss']:.4f} val_prauc={va['pr_auc']:.4f} "
                      f"val_auc={va['roc_auc']:.4f} val_rec@fpr={va['recall_at_fpr']:.4f} "

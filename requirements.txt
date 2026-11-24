@@ -1,6 +1,13 @@
+# =====================================================================
+# FILE: requirements.txt
+# TRẠNG THÁI: ĐÃ SỬA (ghi chú pyg-lib bắt buộc; các dòng khác giữ nguyên)
+# =====================================================================
 # Core Deep Learning & Graph
 torch>=2.0.0
 torch-geometric>=2.4.0
+# pyg-lib is REQUIRED (temporal NeighborLoader) but needs a wheel that matches your torch/CUDA build.
+# Do NOT rely on `pip install -r`; install it separately, e.g.:
+#   pip install pyg_lib -f https://data.pyg.org/whl/torch-<TORCH>+<CUDA>.html
 
 # Data Processing & Manipulation
 pandas>=2.0.0
@@ -18,3 +25,4 @@ scipy>=1.10.0
 
 # Testing (Canary Test)
 pytest>=7.0.0
+scipy>=1.10.0

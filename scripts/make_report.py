@@ -1,8 +1,16 @@
+# =====================================================================
+# FILE: scripts/make_report.py
+# TRẠNG THÁI: ĐÃ SỬA (đường dẫn mặc định: hết lặp "results/results" khi chạy local;
+#                     trên Kaggle tìm cả <repo>/results và /kaggle/working/results, loại trùng)
+# =====================================================================
 #!/usr/bin/env python
 """Final report: merge benchmark CSVs, 300-dpi PNG figures (+PDF), LaTeX tables printed to stdout.
 
-    python scripts/make_report.py                       # Kaggle defaults (/kaggle/working/...)
-    python scripts/make_report.py --results "results/benchmark_results*.csv" --fig_dir figures
+    python scripts/make_report.py                       # defaults: <repo>/results (+ /kaggle/working/results on Kaggle)
+    python scripts/make_report.py --results results/benchmark_results_nnpu.csv --fig_dir figures
+
+Pass --results explicitly when V1 (clamp) and V1.5 (nnpu) CSVs both exist: run_id of tw_nndf is the same in both,
+and the analyzer keeps the LAST row per run_id, so a blind glob would let V1.5 silently replace V1.
 
 All statistics come from src.eval.analyzer (same CI / verdict / Recovery-Ratio rules as the pre-registration).
 Colour follows the METHOD (Okabe-Ito, colour-blind safe); no-GRU variants are hatched; individual seeds are shown.
@@ -43,6 +51,7 @@ MARKERS = {"naive_bce": "s", "maturity_mask": "o", "delay_ipw": "^", "tw_nndf": 
 SHORT = {"naive_bce": "A0", "maturity_mask": "Maturity\nMask", "delay_ipw": "Delay-\nIPW", "tw_nndf": "TW-\nnnDF",
          "oracle": "Oracle"}
 SHADES = ["#BBBBBB", "#666666", "#222222"]
+KAGGLE_ROOT = Path("/kaggle/working")
 
 
 def style(c: A.Cell) -> tuple[str, str, str, str]:
@@ -178,15 +187,32 @@ def bundle(dirs: Sequence[Path], out_zip: Path) -> None:
                     z.write(f, f.relative_to(root.parent))
 
 
+def default_result_patterns() -> list[str]:
+    """Where benchmark CSVs normally live: <repo>/results, plus /kaggle/working/results when it exists."""
+    pats = [str(REPO_ROOT / "results" / "benchmark_results*.csv")]
+    if KAGGLE_ROOT.exists():
+        pats.append(str(KAGGLE_ROOT / "results" / "benchmark_results*.csv"))
+    return pats
+
+
+def expand_files(patterns: Sequence[str]) -> list[str]:
+    """Glob every pattern, drop duplicates that resolve to the same file (repo may BE /kaggle/working)."""
+    seen: dict[Path, str] = {}
+    for pat in patterns:
+        for p in sorted(glob.glob(pat)):
+            seen.setdefault(Path(p).resolve(), p)
+    return sorted(seen.values())
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    base = Path("/kaggle/working") if Path("/kaggle/working").exists() else REPO_ROOT / "results"
+    out_base = KAGGLE_ROOT if KAGGLE_ROOT.exists() else REPO_ROOT / "results"
     ap = argparse.ArgumentParser(description="Figures and LaTeX tables from benchmark CSVs.")
-    ap.add_argument("--results", nargs="+", default=[str(base / "results" / "benchmark_results*.csv")])
-    ap.add_argument("--fig_dir", default=str(base / "figures"))
-    ap.add_argument("--out_dir", default=str(base / "analysis"))
+    ap.add_argument("--results", nargs="+", default=default_result_patterns())
+    ap.add_argument("--fig_dir", default=str(out_base / "figures"))
+    ap.add_argument("--out_dir", default=str(out_base / "analysis"))
     args = ap.parse_args(argv)
 
-    files = sorted({p for pat in args.results for p in glob.glob(pat)})
+    files = expand_files(args.results)
     if not files:
         print(f"[report] ERROR: no CSV matches {args.results}")
         return 1
@@ -202,6 +228,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     summ, comp, rec, prereg = res["summary"], res["comparison"], res["recovery"], res["prereg"]
 
     print(f"[report] {len(files)} file(s), {res['n_runs']} ok runs | pre-registration: {prereg.upper()}")
+    for f in files:
+        print(f"[report] using {f}")
     for w in res["warnings"]:
         print(f"[report] WARNING: {w}")
     figure_bars(values, summ, comp, "test_pr_auc", fig_dir / "fig1_pr_auc_bars.png", prereg)
@@ -218,8 +246,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     for f in sorted(out_dir.glob("table_*.tex")):
         print(f"% ---- {f.name} ----")
         print(f.read_text(encoding="utf-8"))
-    bundle([fig_dir, out_dir], base / "report_bundle.zip")
-    print(f"[report] figures -> {fig_dir} | tables/CSV -> {out_dir} | zip -> {base / 'report_bundle.zip'}")
+    bundle([fig_dir, out_dir], out_base / "report_bundle.zip")
+    print(f"[report] figures -> {fig_dir} | tables/CSV -> {out_dir} | zip -> {out_base / 'report_bundle.zip'}")
     return 0
 
 

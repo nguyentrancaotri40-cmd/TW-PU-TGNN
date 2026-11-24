@@ -1,37 +1,51 @@
 benchmark:
   seeds: [42, 43, 44]
-  # Directory names under data/processed/. Each one carries its own W / delay setting.
-  # 72 runs = 4 losses x 3 delay x 2 tau x 3 seeds needs SIX directories; only two are known to exist.
-  delays: [delay_low, delay_high]
+  # Each delay name = a folder data/processed/<name>, produced by
+  #   python scripts/prepare_data.py --delay_config configs/<name>.yaml
+  delays: [delay_low, delay_high, delay_very_high]
   backbone: sage
-  # lambda of w = 1 - exp(-lambda * age_days). MUST be filled per delay (decision C); null -> the runner refuses.
-  lam_by_delay:
-    delay_low: 0.324      # median ~2.14 d
-    delay_high: 0.080     # median ~8.68 d
-  groups:                       # run order = group order, then delay -> loss -> seed
-    oracle:
+  # Kaggle quota guard: the runner stops cleanly before this many hours (CLI --max_hours overrides it).
+  # Group order below = priority: the 72 method runs first, the 18 oracle runs last.
+  max_hours: 28.0
+  lam_by_delay:                 # ln2 / median of the truncated Weibull at the reference amount
+    delay_low: 0.324            # median ~2.14 d  (scale 3,  shape 1.3, cap 7)
+    delay_high: 0.080           # median ~8.68 d  (scale 12, shape 1.3, cap 30)
+    delay_very_high: 0.040      # median ~17.27 d (scale 27, shape 1.3, cap 45)
+  groups:
+    main_sage:                  # 4 methods x 3 delays x 3 seeds = 36 runs (naive_bce = A0)
       enabled: true
-      oracle: true              # NaiveBCE on y_true; needed for Recovery Ratio
-    main:
-      enabled: true
-      losses: [naive_bce, maturity_mask, delay_ipw, tw_nndf]    # naive_bce = A0
+      backbone: sage
+      losses: [naive_bce, maturity_mask, delay_ipw, tw_nndf]
       lp: false
       use_temporal: true
-    lp_naive:                   # feature-level ATLAS-style LP features + naive_bce (+18 runs in the 90 matrix)
+    main_gat:                   # secondary backbone, 36 runs  -> the 72 method runs end here
+      enabled: true
+      backbone: gat
+      losses: [naive_bce, maturity_mask, delay_ipw, tw_nndf]
+      lp: false
+      use_temporal: true
+    oracle_sage:                # NaiveBCE on y_true (Recovery Ratio), 9 runs, run AFTER the 72
+      enabled: true
+      backbone: sage
+      oracle: true
+    oracle_gat:                 # 9 runs
+      enabled: true
+      backbone: gat
+      oracle: true
+    lp_naive:
       enabled: false
       losses: [naive_bce]
       lp: true
       use_temporal: true
-    ablation_nogru:             # GRU ablation; has its own A0 (naive_bce) for the comparison
+    ablation_nogru:
       enabled: false
       losses: [naive_bce, tw_nndf]
       lp: false
       use_temporal: false
-    prior_sensitivity:          # needs the `prior` diff in run_one; exploratory
+    prior_sensitivity:
       enabled: false
       losses: [tw_nndf]
       lp: false
       use_temporal: true
-      # true fraud rate inside U measured on train (1.39% / 1.82%). The label "oracle prior" is not deployable.
-      # KHÔNG CHẮC: check that TimeWindowNNDFLoss defines `prior` on the same population as these rates.
+      delays: [delay_low, delay_high]
       priors_by_delay: {delay_high: [0.0139], delay_low: [0.0182]}

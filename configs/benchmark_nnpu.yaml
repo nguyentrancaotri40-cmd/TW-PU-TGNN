@@ -1,0 +1,11 @@
+benchmark:
+  seeds: [42, 43, 44]
+  delays: [delay_low, delay_high]
+  backbone: sage
+  lam_by_delay: {delay_low: 0.324, delay_high: 0.080}
+  groups:
+    main:
+      enabled: true
+      losses: [tw_nndf]
+      lp: false
+      use_temporal: true

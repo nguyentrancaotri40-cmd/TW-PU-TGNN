@@ -1,6 +1,7 @@
 """Round-5 tests: loss gradient/output invariants, model label-invariance, forward -> losses smoke.
 
 Self-contained (toy batches); needs torch + torch_geometric, no pyg-lib.
+V1.5: every ``float(loss)`` on a tensor that may require grad now goes through ``.detach()`` (0 warnings).
 """
 from __future__ import annotations
 
@@ -114,7 +115,7 @@ def test_tw_nndf_empty_p_or_u_gives_connected_zero():
     preds = torch.randn(8, requires_grad=True)
     only_n = torch.full((8,), N).long()
     loss = fn(preds, torch.zeros(8).long(), only_n)
-    assert float(loss) == 0.0 and fn.last_risks is None
+    assert float(loss.detach()) == 0.0 and fn.last_risks is None
     loss.backward()  # must not raise
 
 
@@ -153,7 +154,7 @@ def test_empty_selection_returns_connected_zero(make):
     preds = torch.randn(6, requires_grad=True)
     pnu = torch.full((6,), U).long()
     loss = make()(preds, torch.zeros(6).long(), pnu, in_train_view=torch.zeros(6, dtype=torch.bool))
-    assert float(loss) == 0.0
+    assert float(loss.detach()) == 0.0
     loss.backward()
 
 
@@ -168,7 +169,7 @@ def test_all_four_losses_equal_ln2_at_zero_logits():
         TimeWindowNNDFLoss(prior=0.035)(z, y, pnu),  # pi*ln2 + (1-pi)*ln2
     ]
     for v in vals:
-        assert float(v) == pytest.approx(ln2, abs=1e-5)
+        assert float(v.detach()) == pytest.approx(ln2, abs=1e-5)
 
 
 # --------------------------------------------------------------------------- #
@@ -262,5 +263,6 @@ def test_forward_then_four_losses_smoke(conv):
         model.zero_grad(set_to_none=True)
         loss = fn(model(batch), st.y_obs[:bs], st.pnu[:bs], age_days=age, in_train_view=st.in_train_view[:bs])
         assert loss.dim() == 0 and bool(torch.isfinite(loss)), name
-        assert 0.1 < float(loss) < 3.0, f"{name}: implausible initial loss {float(loss)}"  # ~ ln 2 at init
+        value = float(loss.detach())
+        assert 0.1 < value < 3.0, f"{name}: implausible initial loss {value}"  # ~ ln 2 at init
         loss.backward()

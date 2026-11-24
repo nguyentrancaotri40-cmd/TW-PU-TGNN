@@ -48,9 +48,11 @@ results/*
 results/analysis/*.png
 results/analysis/*.pdf
 results/runs/
-results/smoke/
 results/profile/
 *.log
+
+# Giữ smoke CSV (nếu muốn giữ kết quả smoke run)
+!results/smoke/*.csv
 
 # Các output đặc thù của Kaggle (nếu có)
 figures/
@@ -92,3 +94,6 @@ secrets.*
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ---------- Giữ file kết quả benchmark ở gốc (nếu có) ----------
+!benchmark_results*.csv

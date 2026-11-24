@@ -79,6 +79,10 @@ _LAZY: dict[str, tuple[str, str]] = {
     "TimeWindowNNDFLoss": ("src.losses.tw_nndf", "TimeWindowNNDFLoss"),
     "tw_nndf_loss": ("src.losses.tw_nndf", "tw_nndf_loss"),
     "estimate_class_prior": ("src.losses.tw_nndf", "estimate_class_prior"),
+    "HybridTWnnDFLoss": ("src.losses.tw_nndf", "HybridTWnnDFLoss"),
+    "SlidingWindowPrior": ("src.losses.tw_nndf", "SlidingWindowPrior"),
+    "MatureTemperatureTracker": ("src.losses.calibration", "MatureTemperatureTracker"),
+    "trusted_negative_mask": ("src.losses.maturity_mask", "trusted_negative_mask"),
 }
 LOSS_CLASSES: dict[str, str] = {
     "naive_bce": "NaiveBCELoss",

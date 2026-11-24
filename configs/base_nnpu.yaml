@@ -1,0 +1,106 @@
+# configs/base_nnpu.yaml -- V1.5 config: IDENTICAL to base.yaml (kept as an explicit copy for the nnpu runs).
+# Keep it a COMPLETE file: run_one / profile_epoch / smoke_forward read cfg["sampler"], cfg["model"], cfg["train"]
+# directly, and the benchmark config hash covers sampler/model/train/eval/loss/features.
+# tests/test_config_nnpu.py checks that it differs from base.yaml only in `loss` (currently: not at all).
+
+seed: 42
+seeds: [42, 43, 44]            # 3 seeds -> 95% CI against the naive baseline A0
+
+paths:
+  data_dir: data
+  processed_dir: data/processed
+  results_dir: results
+  checkpoints_dir: checkpoints
+
+split:
+  train_ratio: 0.65
+  val_ratio: 0.16
+  test_ratio: 0.19
+  by: time                     # time | count
+  snap_to_day: true
+
+features:
+  lp_features:
+    enabled: false       # true -> model_in_dim = feature_dim + 4 (461)
+    maturity_window_days: null
+    negative_rule: maturity_window
+    log1p_counts: true
+
+graph:
+  entities:
+    card:
+      key_cols: [card1, card2, card3, card4, card5, card6]
+      required_cols: [card1]
+      max_degree: 2000
+    device:
+      key_cols: [DeviceInfo, id_30, id_31]
+      required_cols: [DeviceInfo]
+      max_degree: 2000
+  features:
+    onehot_cols: [ProductCD, card4, card6, M1, M2, M3, M4, M5, M6, M7, M8, M9]
+    numeric_exclude: [card1, addr1, addr2]   # id-like codes: not meaningful as numbers
+    max_categories: 30
+    max_missing_ratio: 0.9
+    clip_z: 10.0
+    add_missing_ratio: true
+    email:
+      cols: [P_emaildomain]
+      top_k: 10
+      add_frequency: true
+
+sampler:
+  num_neighbors: [15, 10]
+  batch_size: 1024
+  eval_batch_size: 2048
+  temporal_strategy: uniform   # uniform | last
+  strict_time: true            # neighbours must be STRICTLY earlier than the seed
+  num_workers: 0
+
+model:
+  backbone: sage         # sage (main) | gat (secondary check)
+  hidden_dim: 128
+  num_layers: 2
+  dropout: 0.2
+  entity_embedding_dim: 32
+  gat_heads: 4
+  max_history: 20
+  gru_layers: 1
+  use_temporal: true
+
+train:
+  lr: 0.001
+  weight_decay: 0.00001
+  epochs: 30
+  patience: 5
+  warmup_epochs: 1
+  min_delta: 0.0
+  monitor: pr_auc        # VALIDATION
+  grad_clip: 1.0
+
+eval:
+  fpr: 0.01
+  review_cost: 0.0       # EFL = missed fraud amount + review_cost * #FP. 0 = no explicit FP cost (KHÔNG CHẮC)
+
+loss:
+  name: naive_bce        # naive_bce | maturity_mask | delay_ipw | tw_nndf
+  delay_ipw: {lam: 0.23} # overridden per delay by benchmark.lam_by_delay
+  maturity_mask:
+    amount_aware: false          # C12 locked: main matrix = plain Maturity-Masked BCE (true only in the ablation)
+    amount_quantile: 0.95
+    amount_min_age_days: null    # null -> W/2
+  tw_nndf:
+    variant: hybrid              # Maturity-Masked BCE + Cost-Sensitive nnPU (pu_only = ablation)
+    unlabeled_statuses: [U]
+    mode: nnpu
+    beta: 0.0
+    gamma: 1.0
+    lambda_pu: 0.3               # locked V1.5 (design choice, KHÔNG CHẮC)
+    prior_mode: sliding_unlabeled  # mature_mean | sliding_window | sliding_unlabeled | sliding_dynamic
+    prior_span_days: 14
+    prior_n_windows: 3
+    amount_weighted: true        # cost-sensitive nnPU (TransactionAmt)
+    max_weight: 10.0
+    amount_aware: true           # trusted U rows: amount >= p95(TRAIN) and age >= amount_min_age_days
+    amount_quantile: 0.95
+    amount_min_age_days: null    # null -> W/2
+    calibration: {enabled: true, max_samples: 200000, t_min: 0.5, t_max: 4.0}   # t_min 0.25 -> 0.5 (U gradient)
