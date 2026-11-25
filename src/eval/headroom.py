@@ -37,22 +37,40 @@ def load_summary(path: str) -> list[dict]:
 
 def headroom_table(rows: Iterable[dict], baseline: str = "naive_bce",
                    metrics: tuple[str, ...] = ("test_pr_auc", "test_efl_ratio")) -> list[dict]:
+    """Compare stable loss/variant identifiers; fall back to `method` for legacy summary files."""
     rows = list(rows)
-    key = {(r["delay"], r["method"], r["metric"]): r for r in rows}
+
+    def loss_of(row: dict) -> str:
+        return str(row.get("loss") or row.get("method") or "")
+
+    def variant_of(row: dict) -> str:
+        value = row.get("variant", "")
+        return "" if value in (None, "", "None", "null") else str(value)
+
+    key = {
+        (r["delay"], loss_of(r), variant_of(r), r["metric"]): r
+        for r in rows
+    }
     out = []
-    for (delay, method, metric), r in key.items():
-        if method == baseline or metric not in metrics or (delay, baseline, metric) not in key:
+    for (delay, loss, variant, metric), r in key.items():
+        if loss == baseline and not variant:
             continue
-        a = key[(delay, baseline, metric)]
+        if metric not in metrics or (delay, baseline, "", metric) not in key:
+            continue
+        a = key[(delay, baseline, "", metric)]
         ci = welch_diff_ci(float(a["mean"]), float(a["half"]), int(a["n"]),
                            float(r["mean"]), float(r["half"]), int(r["n"]))
-        out.append({"delay": delay, "metric": metric, "method": method, **ci})
-    return sorted(out, key=lambda x: (x["delay"], x["metric"], x["method"]))
+        out.append({
+            "delay": delay, "metric": metric, "method": r.get("method", loss),
+            "loss": loss, "variant": variant, **ci,
+        })
+    return sorted(out, key=lambda x: (x["delay"], x["metric"], x["loss"], x["variant"]))
 
 
 def has_headroom(row: dict) -> bool:
-    """Pre-specified rule (my choice, no external source): oracle better than A0 on PR-AUC, CI excludes 0."""
-    return row["metric"] == "test_pr_auc" and row["method"] == "oracle" and row["excludes_zero"] and row["diff"] > 0
+    """Pre-specified rule: oracle better than A0 on PR-AUC, with a CI excluding zero."""
+    loss = str(row.get("loss") or row.get("method") or "")
+    return row["metric"] == "test_pr_auc" and loss == "oracle" and row["excludes_zero"] and row["diff"] > 0
 
 
 def main(argv=None) -> int:

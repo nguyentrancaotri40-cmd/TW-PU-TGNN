@@ -7,6 +7,7 @@ Rules implemented (pre-registered, see README):
   outside A0's CI on the favourable side; otherwise "n/r" and the reason is kept;
 * CI = Student-t over seeds (src.eval.metrics.ci95). With 3 seeds t = 4.303, so CIs are wide: "within CI" is common.
 Only rows with status == "ok" are used; a duplicate run_id keeps the LAST row.
+Rows are grouped by both ``loss`` and ``variant`` so separate V2 variants never collapse into one cell.
 """
 from __future__ import annotations
 
@@ -34,19 +35,23 @@ class Cell(NamedTuple):
     backbone: str
     use_temporal: bool
     lp: bool
+    variant: str | None = None
 
 
 METRICS: dict[str, tuple[str, bool]] = {   # column -> (header, higher_is_better)
     "test_pr_auc": ("PR-AUC", True),
     "test_roc_auc": ("ROC-AUC", True),
-    "test_recall_at_fpr": ("Rec@FPR", True),
+    "test_recall_at_fpr": ("Recall@validation threshold", True),
     "test_efl_ratio": ("EFL ratio", False),
 }
 PRIMARY = ("test_pr_auc", "test_efl_ratio")
 DIAG_COLS = ("test_fpr_at_valthr", "test_recall_at_valthr", "val_pr_auc", "best_epoch", "epochs_run",
              "train_seconds", "peak_vram_alloc_mb")
-NNDF_COLS = ("nndf_prior", "nndf_prior_estimated", "diag_true_fraud_rate_in_U", "nndf_clamped_best",
-             "nndf_clamped_mean", "nndf_neg_risk_raw_best", "nndf_pos_risk_best", "n_empty_batches_total")
+NNDF_COLS = (
+    "nndf_prior", "nndf_prior_estimated", "diag_true_fraud_rate_in_U", "nndf_clamped_best",
+    "nndf_clamped_mean", "nndf_neg_risk_raw_best", "nndf_pos_risk_best", "n_empty_batches_total",
+    "nndf_negative_risk_rate", "nndf_ascent_rate", "nndf_zero_pu_rate",
+)
 LABELS = {"naive_bce": "A0 Naive BCE", "maturity_mask": "Maturity Masking", "delay_ipw": "Delay-IPW",
           "tw_nndf": "TW-nnDF", "oracle": r"Oracle ($y_{\mathrm{true}}$)"}
 _ORDER = {"naive_bce": 0, "maturity_mask": 1, "delay_ipw": 2, "tw_nndf": 3, "oracle": 9}
@@ -94,12 +99,16 @@ def clean_rows(rows: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]],
         p: dict[str, Any] = {
             "run_id": str(r["run_id"]), "delay": str(r["delay"]), "loss": str(r["loss"]),
             "backbone": str(r["backbone"]), "use_temporal": _b(r["use_temporal"]), "lp": _b(r["lp_features"]),
+            "variant": (
+                None if str(r.get("variant", "")).strip().lower() in {"", "none", "null"}
+                else str(r.get("variant", "")).strip()
+            ),
             "seed": int(float(r["seed"])), "prereg_status": str(r.get("prereg_status", "")),
             "prior_override": r.get("prior_override", ""),
         }
         p.update({c: _f(r.get(c)) for c in num_cols})
         parsed.append(p)
-    parsed.sort(key=lambda p: (p["delay"], p["loss"], p["seed"]))
+    parsed.sort(key=lambda p: (p["delay"], p["loss"], p.get("variant") or "", p["seed"]))
     return parsed, warns
 
 
@@ -109,7 +118,7 @@ def collect_values(parsed: Sequence[Mapping[str, Any]]) -> dict[Cell, dict[str, 
     for p in sorted(parsed, key=lambda q: q["seed"]):
         if str(p.get("prior_override", "")) not in ("", "None"):
             continue
-        cell = Cell(p["delay"], p["loss"], p["backbone"], p["use_temporal"], p["lp"])
+        cell = Cell(p["delay"], p["loss"], p["backbone"], p["use_temporal"], p["lp"], p.get("variant"))
         d = out.setdefault(cell, {m: [] for m in METRICS})
         for m in METRICS:
             if math.isfinite(p[m]):
@@ -125,15 +134,16 @@ def _kind(c: Cell) -> str:
 
 
 def _a0(c: Cell) -> Cell:
-    return Cell(c.delay, "naive_bce", c.backbone, c.use_temporal, False)
+    # All method variants compare against the same non-variant A0 baseline.
+    return Cell(c.delay, "naive_bce", c.backbone, c.use_temporal, False, None)
 
 
 def _oracle(c: Cell) -> Cell:
-    return Cell(c.delay, "oracle", c.backbone, c.use_temporal, False)
+    return Cell(c.delay, "oracle", c.backbone, c.use_temporal, False, None)
 
 
 def _sort_key(c: Cell) -> tuple:
-    return (c.delay, c.backbone, _ORDER.get(c.loss, 5), not c.use_temporal, c.lp)
+    return (c.delay, c.backbone, _ORDER.get(c.loss, 5), not c.use_temporal, c.lp, c.variant or "")
 
 
 def summarise(values: Mapping[Cell, Mapping[str, Sequence[float]]]) -> dict[tuple[Cell, str], dict[str, float]]:
@@ -181,8 +191,9 @@ def recovery_table(values: Mapping[Cell, Mapping[str, Sequence[float]]]) -> list
         a0, orc = values.get(_a0(cell)), values.get(_oracle(cell))
         for m in PRIMARY:
             higher = METRICS[m][1]
-            rec: dict[str, Any] = {"delay": cell.delay, "loss": cell.loss, "backbone": cell.backbone,
-                                   "use_temporal": cell.use_temporal, "lp": cell.lp, "metric": m, "reported": False,
+            rec: dict[str, Any] = {"delay": cell.delay, "loss": cell.loss, "variant": cell.variant,
+                                   "backbone": cell.backbone, "use_temporal": cell.use_temporal, "lp": cell.lp,
+                                   "metric": m, "reported": False,
                                    "value": NAN, "reason": "", "method_mean": NAN, "naive_mean": NAN,
                                    "oracle_mean": NAN, "naive_ci_low": NAN, "naive_ci_high": NAN,
                                    "n_method": len(values[cell].get(m, [])),
@@ -205,14 +216,19 @@ def recovery_table(values: Mapping[Cell, Mapping[str, Sequence[float]]]) -> list
 
 
 def nndf_diagnostics(parsed: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Seed-mean of the tw_nndf clamp / prior diagnostics per (delay, backbone, temporal, lp)."""
+    """Seed-mean of TW-nnDF diagnostics, kept separate for each explicit variant."""
     groups: dict[tuple, list[Mapping[str, Any]]] = {}
     for p in parsed:
         if p["loss"] == "tw_nndf" and str(p.get("prior_override", "")) in ("", "None"):
-            groups.setdefault((p["delay"], p["backbone"], p["use_temporal"], p["lp"]), []).append(p)
+            groups.setdefault(
+                (p["delay"], p["backbone"], p["use_temporal"], p["lp"], p.get("variant")), []
+            ).append(p)
     out = []
-    for (delay, bb, tmp, lp), ps in sorted(groups.items()):
-        row: dict[str, Any] = {"delay": delay, "backbone": bb, "use_temporal": tmp, "lp": lp, "n_seeds": len(ps)}
+    for (delay, bb, tmp, lp, variant), ps in sorted(groups.items(), key=lambda kv: tuple(str(x) for x in kv[0])):
+        row: dict[str, Any] = {
+            "delay": delay, "backbone": bb, "use_temporal": tmp, "lp": lp,
+            "variant": variant, "n_seeds": len(ps),
+        }
         for c in NNDF_COLS:
             vals = [q[c] for q in ps if math.isfinite(q[c])]
             row[c] = float(np.mean(vals)) if vals else NAN
@@ -231,10 +247,12 @@ def _esc(s: str) -> str:
 
 def method_label(c: Cell, latex: bool = True) -> str:
     base = LABELS.get(c.loss, _esc(c.loss)) if latex else c.loss
+    if c.variant:
+        base += f" [{_esc(c.variant) if latex else c.variant}]"
     if c.lp:
         base += " + LP feat."
     if not c.use_temporal:
-        base += " (no GRU)"
+        base += " (no temporal module)"
     if c.backbone != "sage":
         base += f" [{c.backbone}]"
     return base
@@ -290,7 +308,9 @@ def main_table_tex(delay: str, summ: Mapping[tuple[Cell, str], Mapping[str, floa
 def recovery_table_tex(rec: Sequence[Mapping[str, Any]], prereg: str) -> str:
     keyed: dict[tuple, dict[str, Mapping[str, Any]]] = {}
     for r in rec:
-        keyed.setdefault((r["delay"], r["backbone"], r["loss"], r["use_temporal"], r["lp"]), {})[r["metric"]] = r
+        keyed.setdefault(
+            (r["delay"], r["loss"], r["backbone"], r["use_temporal"], r["lp"], r.get("variant")), {}
+        )[r["metric"]] = r
 
     def cell_txt(r: Mapping[str, Any] | None) -> str:
         return "--" if r is None else (f"{r['value']:.2f}" if r["reported"] else "n/r")
@@ -303,8 +323,10 @@ def recovery_table_tex(rec: Sequence[Mapping[str, Any]], prereg: str) -> str:
         r"\label{tab:recovery}", r"\begin{tabular}{llcc}", r"\toprule",
         r"Delay & Method & RR PR-AUC & RR EFL \\", r"\midrule",
     ]
-    for (delay, bb, loss, tmp, lp), d in sorted(keyed.items(), key=lambda kv: _sort_key(Cell(*kv[0]))):
-        c = Cell(delay, loss, bb, tmp, lp)
+    for (delay, loss, bb, tmp, lp, variant), d in sorted(
+        keyed.items(), key=lambda kv: _sort_key(Cell(*kv[0]))
+    ):
+        c = Cell(delay, loss, bb, tmp, lp, variant)
         lines.append(f"{_esc(delay)} & {method_label(c)} & {cell_txt(d.get('test_pr_auc'))} & {cell_txt(d.get('test_efl_ratio'))} \\\\")
     lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
     return "\n".join(lines) + "\n"
@@ -371,7 +393,8 @@ def run_analysis(rows: Sequence[Mapping[str, Any]], out_dir: str | Path, *, plot
         warns.append("some cells have fewer than 2 seeds: no CI, no verdict")
     summ, comp, rec, diag = summarise(values), compare_to_naive(values), recovery_table(values), nndf_diagnostics(parsed)
 
-    summary_rows = [{"delay": c.delay, "method": method_label(c, latex=False), "loss": c.loss, "backbone": c.backbone,
+    summary_rows = [{"delay": c.delay, "method": method_label(c, latex=False), "loss": c.loss,
+                     "variant": c.variant or "", "backbone": c.backbone,
                      "use_temporal": c.use_temporal, "lp": c.lp, "metric": m, **s,
                      "verdict": comp.get((c, m), {}).get("verdict", "")} for (c, m), s in sorted(summ.items(), key=lambda kv: (_sort_key(kv[0][0]), kv[0][1]))]
     _write_csv(out / "summary.csv", summary_rows)

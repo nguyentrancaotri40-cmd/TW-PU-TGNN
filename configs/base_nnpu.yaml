@@ -1,4 +1,4 @@
-# configs/base_nnpu.yaml -- V1.5 config: IDENTICAL to base.yaml (kept as an explicit copy for the nnpu runs).
+# configs/base_nnpu.yaml -- V2 config: IDENTICAL to base.yaml (kept as an explicit copy for the nnpu runs).
 # Keep it a COMPLETE file: run_one / profile_epoch / smoke_forward read cfg["sampler"], cfg["model"], cfg["train"]
 # directly, and the benchmark config hash covers sampler/model/train/eval/loss/features.
 # tests/test_config_nnpu.py checks that it differs from base.yaml only in `loss` (currently: not at all).
@@ -65,7 +65,7 @@ model:
   gat_heads: 4
   max_history: 20
   gru_layers: 1
-  use_temporal: true
+  use_temporal: false
 
 train:
   lr: 0.001

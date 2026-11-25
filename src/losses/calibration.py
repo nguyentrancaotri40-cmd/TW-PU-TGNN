@@ -15,8 +15,9 @@ Safeguards added in V1.5 (preflight)
   observed after 3 epochs, and at T = 0.25 every U row lost its gradient) is CLAMPED up to 0.5. Trade-off: a little
   calibration sharpness is given up to keep the gradient signal on U. The raw (pre-clamp) value is kept in
   ``last_raw_temperature`` and every clamp increments ``floor_hits`` (report them in Threats to Validity).
-* Prior floor ``MIN_UNLABELED_PRIOR = 0.002`` for the unlabeled prior: ``(pi*(n_P+n_U) - n_P) / n_U`` can be <= 0
-  when the pooled prior is under-estimated, and a prior ~0 turns nnPU into "every U row is a negative".
+* The unlabeled prior is clipped only by the numerical ``PRIOR_EPS`` bound. No floor is calibrated from hidden
+  fraud prevalence or any other oracle information. If the train-only estimate is negative, the returned value is
+  ``PRIOR_EPS`` and the raw estimate should be retained in diagnostics / sensitivity analysis.
 """
 from __future__ import annotations
 
@@ -31,7 +32,6 @@ from torch import Tensor
 from src.losses import PNU_P, PNU_U
 
 PRIOR_EPS: float = 1e-4
-MIN_UNLABELED_PRIOR: float = 0.002   # floor of the unlabeled prior (true hidden rate in U is ~0.014-0.018)
 T_MIN_DEFAULT: float = 0.5           # temperature floor (see module docstring)
 T_MAX_DEFAULT: float = 4.0
 
@@ -120,12 +120,12 @@ def unlabeled_prior(
     n_pos_young: int,
     n_unl_young: int,
     eps: float = PRIOR_EPS,
-    min_prior: float = MIN_UNLABELED_PRIOR,
+    min_prior: float = PRIOR_EPS,
 ) -> float:
-    """Positive prior inside the young unlabeled set, floored at ``min_prior`` and clipped to (eps, 1 - eps).
+    """Positive prior inside the young unlabeled set, bounded only by a numerical epsilon.
 
-    The floor protects nnPU from a prior ~0 (which would read every U row as a negative). ``min_prior = 0``
-    reproduces the pre-V1.5 behaviour (only the ``eps`` clip).
+    ``min_prior`` is retained as an explicit caller override for controlled sensitivity checks. Its default is
+    ``PRIOR_EPS``; no empirical/hidden fraud-rate floor is applied. Set it to 0.0 to rely solely on ``eps``.
     """
     if not 0.0 <= min_prior < 1.0:
         raise ValueError("min_prior must be in [0, 1).")
@@ -334,5 +334,5 @@ def calibrated_prior(logits_unlabeled: Tensor, scaler: TemperatureScaler, eps: f
 __all__ = [
     "PriorEstimate", "sliding_window_prior", "young_counts", "unlabeled_prior", "unlabeled_prior_raw",
     "TemperatureScaler", "TemperatureScaling", "MatureTemperatureTracker", "SlidingWindowPrior",
-    "calibrated_prior", "PRIOR_EPS", "MIN_UNLABELED_PRIOR", "T_MIN_DEFAULT", "T_MAX_DEFAULT",
+    "calibrated_prior", "PRIOR_EPS", "T_MIN_DEFAULT", "T_MAX_DEFAULT",
 ]

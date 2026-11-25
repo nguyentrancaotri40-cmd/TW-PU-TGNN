@@ -1,7 +1,6 @@
 ## PROJECT TREE
 ├── TW-PU-TGNN/
 │   ├── .gitignore
-│   ├── all_code_for_claude.txt
 │   ├── export_code.py
 │   ├── pytest.ini
 │   ├── README.md
@@ -11,12 +10,15 @@
 │   │   ├── base_nnpu.yaml
 │   │   ├── benchmark.yaml
 │   │   ├── benchmark_nnpu.yaml
+│   │   ├── benchmark_v2_probe.yaml
 │   │   ├── delay_high.yaml
 │   │   ├── delay_low.yaml
+│   │   ├── delay_very_high.yaml
 │   ├── notebooks/
 │   ├── scripts/
 │   │   ├── check_sampler_causality.py
 │   │   ├── make_report.py
+│   │   ├── preflight_checks.py
 │   │   ├── prepare_data.py
 │   │   ├── profile_data.py
 │   │   ├── profile_epoch.py
@@ -60,6 +62,9 @@
 │   │   ├── test_trainer.py
 │   │   ├── test_tw_nndf_ascent.py
 │   │   ├── test_tw_nndf_hybrid.py
+│   │   ├── test_v15_preflight_fixes.py
+│   │   ├── test_v2_dummy.py
+│   │   ├── test_v2_final.py
 
 
 
@@ -81,6 +86,7 @@ Rules implemented (pre-registered, see README):
   outside A0's CI on the favourable side; otherwise "n/r" and the reason is kept;
 * CI = Student-t over seeds (src.eval.metrics.ci95). With 3 seeds t = 4.303, so CIs are wide: "within CI" is common.
 Only rows with status == "ok" are used; a duplicate run_id keeps the LAST row.
+Rows are grouped by both ``loss`` and ``variant`` so separate V2 variants never collapse into one cell.
 """
 from __future__ import annotations
 
@@ -108,19 +114,23 @@ class Cell(NamedTuple):
     backbone: str
     use_temporal: bool
     lp: bool
+    variant: str | None = None
 
 
 METRICS: dict[str, tuple[str, bool]] = {   # column -> (header, higher_is_better)
     "test_pr_auc": ("PR-AUC", True),
     "test_roc_auc": ("ROC-AUC", True),
-    "test_recall_at_fpr": ("Rec@FPR", True),
+    "test_recall_at_fpr": ("Recall@validation threshold", True),
     "test_efl_ratio": ("EFL ratio", False),
 }
 PRIMARY = ("test_pr_auc", "test_efl_ratio")
 DIAG_COLS = ("test_fpr_at_valthr", "test_recall_at_valthr", "val_pr_auc", "best_epoch", "epochs_run",
              "train_seconds", "peak_vram_alloc_mb")
-NNDF_COLS = ("nndf_prior", "nndf_prior_estimated", "diag_true_fraud_rate_in_U", "nndf_clamped_best",
-             "nndf_clamped_mean", "nndf_neg_risk_raw_best", "nndf_pos_risk_best", "n_empty_batches_total")
+NNDF_COLS = (
+    "nndf_prior", "nndf_prior_estimated", "diag_true_fraud_rate_in_U", "nndf_clamped_best",
+    "nndf_clamped_mean", "nndf_neg_risk_raw_best", "nndf_pos_risk_best", "n_empty_batches_total",
+    "nndf_negative_risk_rate", "nndf_ascent_rate", "nndf_zero_pu_rate",
+)
 LABELS = {"naive_bce": "A0 Naive BCE", "maturity_mask": "Maturity Masking", "delay_ipw": "Delay-IPW",
           "tw_nndf": "TW-nnDF", "oracle": r"Oracle ($y_{\mathrm{true}}$)"}
 _ORDER = {"naive_bce": 0, "maturity_mask": 1, "delay_ipw": 2, "tw_nndf": 3, "oracle": 9}
@@ -168,12 +178,16 @@ def clean_rows(rows: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]],
         p: dict[str, Any] = {
             "run_id": str(r["run_id"]), "delay": str(r["delay"]), "loss": str(r["loss"]),
             "backbone": str(r["backbone"]), "use_temporal": _b(r["use_temporal"]), "lp": _b(r["lp_features"]),
+            "variant": (
+                None if str(r.get("variant", "")).strip().lower() in {"", "none", "null"}
+                else str(r.get("variant", "")).strip()
+            ),
             "seed": int(float(r["seed"])), "prereg_status": str(r.get("prereg_status", "")),
             "prior_override": r.get("prior_override", ""),
         }
         p.update({c: _f(r.get(c)) for c in num_cols})
         parsed.append(p)
-    parsed.sort(key=lambda p: (p["delay"], p["loss"], p["seed"]))
+    parsed.sort(key=lambda p: (p["delay"], p["loss"], p.get("variant") or "", p["seed"]))
     return parsed, warns
 
 
@@ -183,7 +197,7 @@ def collect_values(parsed: Sequence[Mapping[str, Any]]) -> dict[Cell, dict[str, 
     for p in sorted(parsed, key=lambda q: q["seed"]):
         if str(p.get("prior_override", "")) not in ("", "None"):
             continue
-        cell = Cell(p["delay"], p["loss"], p["backbone"], p["use_temporal"], p["lp"])
+        cell = Cell(p["delay"], p["loss"], p["backbone"], p["use_temporal"], p["lp"], p.get("variant"))
         d = out.setdefault(cell, {m: [] for m in METRICS})
         for m in METRICS:
             if math.isfinite(p[m]):
@@ -199,15 +213,16 @@ def _kind(c: Cell) -> str:
 
 
 def _a0(c: Cell) -> Cell:
-    return Cell(c.delay, "naive_bce", c.backbone, c.use_temporal, False)
+    # All method variants compare against the same non-variant A0 baseline.
+    return Cell(c.delay, "naive_bce", c.backbone, c.use_temporal, False, None)
 
 
 def _oracle(c: Cell) -> Cell:
-    return Cell(c.delay, "oracle", c.backbone, c.use_temporal, False)
+    return Cell(c.delay, "oracle", c.backbone, c.use_temporal, False, None)
 
 
 def _sort_key(c: Cell) -> tuple:
-    return (c.delay, c.backbone, _ORDER.get(c.loss, 5), not c.use_temporal, c.lp)
+    return (c.delay, c.backbone, _ORDER.get(c.loss, 5), not c.use_temporal, c.lp, c.variant or "")
 
 
 def summarise(values: Mapping[Cell, Mapping[str, Sequence[float]]]) -> dict[tuple[Cell, str], dict[str, float]]:
@@ -255,8 +270,9 @@ def recovery_table(values: Mapping[Cell, Mapping[str, Sequence[float]]]) -> list
         a0, orc = values.get(_a0(cell)), values.get(_oracle(cell))
         for m in PRIMARY:
             higher = METRICS[m][1]
-            rec: dict[str, Any] = {"delay": cell.delay, "loss": cell.loss, "backbone": cell.backbone,
-                                   "use_temporal": cell.use_temporal, "lp": cell.lp, "metric": m, "reported": False,
+            rec: dict[str, Any] = {"delay": cell.delay, "loss": cell.loss, "variant": cell.variant,
+                                   "backbone": cell.backbone, "use_temporal": cell.use_temporal, "lp": cell.lp,
+                                   "metric": m, "reported": False,
                                    "value": NAN, "reason": "", "method_mean": NAN, "naive_mean": NAN,
                                    "oracle_mean": NAN, "naive_ci_low": NAN, "naive_ci_high": NAN,
                                    "n_method": len(values[cell].get(m, [])),
@@ -279,14 +295,19 @@ def recovery_table(values: Mapping[Cell, Mapping[str, Sequence[float]]]) -> list
 
 
 def nndf_diagnostics(parsed: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Seed-mean of the tw_nndf clamp / prior diagnostics per (delay, backbone, temporal, lp)."""
+    """Seed-mean of TW-nnDF diagnostics, kept separate for each explicit variant."""
     groups: dict[tuple, list[Mapping[str, Any]]] = {}
     for p in parsed:
         if p["loss"] == "tw_nndf" and str(p.get("prior_override", "")) in ("", "None"):
-            groups.setdefault((p["delay"], p["backbone"], p["use_temporal"], p["lp"]), []).append(p)
+            groups.setdefault(
+                (p["delay"], p["backbone"], p["use_temporal"], p["lp"], p.get("variant")), []
+            ).append(p)
     out = []
-    for (delay, bb, tmp, lp), ps in sorted(groups.items()):
-        row: dict[str, Any] = {"delay": delay, "backbone": bb, "use_temporal": tmp, "lp": lp, "n_seeds": len(ps)}
+    for (delay, bb, tmp, lp, variant), ps in sorted(groups.items(), key=lambda kv: tuple(str(x) for x in kv[0])):
+        row: dict[str, Any] = {
+            "delay": delay, "backbone": bb, "use_temporal": tmp, "lp": lp,
+            "variant": variant, "n_seeds": len(ps),
+        }
         for c in NNDF_COLS:
             vals = [q[c] for q in ps if math.isfinite(q[c])]
             row[c] = float(np.mean(vals)) if vals else NAN
@@ -305,10 +326,12 @@ def _esc(s: str) -> str:
 
 def method_label(c: Cell, latex: bool = True) -> str:
     base = LABELS.get(c.loss, _esc(c.loss)) if latex else c.loss
+    if c.variant:
+        base += f" [{_esc(c.variant) if latex else c.variant}]"
     if c.lp:
         base += " + LP feat."
     if not c.use_temporal:
-        base += " (no GRU)"
+        base += " (no temporal module)"
     if c.backbone != "sage":
         base += f" [{c.backbone}]"
     return base
@@ -364,7 +387,9 @@ def main_table_tex(delay: str, summ: Mapping[tuple[Cell, str], Mapping[str, floa
 def recovery_table_tex(rec: Sequence[Mapping[str, Any]], prereg: str) -> str:
     keyed: dict[tuple, dict[str, Mapping[str, Any]]] = {}
     for r in rec:
-        keyed.setdefault((r["delay"], r["backbone"], r["loss"], r["use_temporal"], r["lp"]), {})[r["metric"]] = r
+        keyed.setdefault(
+            (r["delay"], r["loss"], r["backbone"], r["use_temporal"], r["lp"], r.get("variant")), {}
+        )[r["metric"]] = r
 
     def cell_txt(r: Mapping[str, Any] | None) -> str:
         return "--" if r is None else (f"{r['value']:.2f}" if r["reported"] else "n/r")
@@ -377,8 +402,10 @@ def recovery_table_tex(rec: Sequence[Mapping[str, Any]], prereg: str) -> str:
         r"\label{tab:recovery}", r"\begin{tabular}{llcc}", r"\toprule",
         r"Delay & Method & RR PR-AUC & RR EFL \\", r"\midrule",
     ]
-    for (delay, bb, loss, tmp, lp), d in sorted(keyed.items(), key=lambda kv: _sort_key(Cell(*kv[0]))):
-        c = Cell(delay, loss, bb, tmp, lp)
+    for (delay, loss, bb, tmp, lp, variant), d in sorted(
+        keyed.items(), key=lambda kv: _sort_key(Cell(*kv[0]))
+    ):
+        c = Cell(delay, loss, bb, tmp, lp, variant)
         lines.append(f"{_esc(delay)} & {method_label(c)} & {cell_txt(d.get('test_pr_auc'))} & {cell_txt(d.get('test_efl_ratio'))} \\\\")
     lines += [r"\bottomrule", r"\end{tabular}", r"\end{table}"]
     return "\n".join(lines) + "\n"
@@ -445,7 +472,8 @@ def run_analysis(rows: Sequence[Mapping[str, Any]], out_dir: str | Path, *, plot
         warns.append("some cells have fewer than 2 seeds: no CI, no verdict")
     summ, comp, rec, diag = summarise(values), compare_to_naive(values), recovery_table(values), nndf_diagnostics(parsed)
 
-    summary_rows = [{"delay": c.delay, "method": method_label(c, latex=False), "loss": c.loss, "backbone": c.backbone,
+    summary_rows = [{"delay": c.delay, "method": method_label(c, latex=False), "loss": c.loss,
+                     "variant": c.variant or "", "backbone": c.backbone,
                      "use_temporal": c.use_temporal, "lp": c.lp, "metric": m, **s,
                      "verdict": comp.get((c, m), {}).get("verdict", "")} for (c, m), s in sorted(summ.items(), key=lambda kv: (_sort_key(kv[0][0]), kv[0][1]))]
     _write_csv(out / "summary.csv", summary_rows)
@@ -543,22 +571,40 @@ def load_summary(path: str) -> list[dict]:
 
 def headroom_table(rows: Iterable[dict], baseline: str = "naive_bce",
                    metrics: tuple[str, ...] = ("test_pr_auc", "test_efl_ratio")) -> list[dict]:
+    """Compare stable loss/variant identifiers; fall back to `method` for legacy summary files."""
     rows = list(rows)
-    key = {(r["delay"], r["method"], r["metric"]): r for r in rows}
+
+    def loss_of(row: dict) -> str:
+        return str(row.get("loss") or row.get("method") or "")
+
+    def variant_of(row: dict) -> str:
+        value = row.get("variant", "")
+        return "" if value in (None, "", "None", "null") else str(value)
+
+    key = {
+        (r["delay"], loss_of(r), variant_of(r), r["metric"]): r
+        for r in rows
+    }
     out = []
-    for (delay, method, metric), r in key.items():
-        if method == baseline or metric not in metrics or (delay, baseline, metric) not in key:
+    for (delay, loss, variant, metric), r in key.items():
+        if loss == baseline and not variant:
             continue
-        a = key[(delay, baseline, metric)]
+        if metric not in metrics or (delay, baseline, "", metric) not in key:
+            continue
+        a = key[(delay, baseline, "", metric)]
         ci = welch_diff_ci(float(a["mean"]), float(a["half"]), int(a["n"]),
                            float(r["mean"]), float(r["half"]), int(r["n"]))
-        out.append({"delay": delay, "metric": metric, "method": method, **ci})
-    return sorted(out, key=lambda x: (x["delay"], x["metric"], x["method"]))
+        out.append({
+            "delay": delay, "metric": metric, "method": r.get("method", loss),
+            "loss": loss, "variant": variant, **ci,
+        })
+    return sorted(out, key=lambda x: (x["delay"], x["metric"], x["loss"], x["variant"]))
 
 
 def has_headroom(row: dict) -> bool:
-    """Pre-specified rule (my choice, no external source): oracle better than A0 on PR-AUC, CI excludes 0."""
-    return row["metric"] == "test_pr_auc" and row["method"] == "oracle" and row["excludes_zero"] and row["diff"] > 0
+    """Pre-specified rule: oracle better than A0 on PR-AUC, with a CI excluding zero."""
+    loss = str(row.get("loss") or row.get("method") or "")
+    return row["metric"] == "test_pr_auc" and loss == "oracle" and row["excludes_zero"] and row["diff"] > 0
 
 
 def main(argv=None) -> int:
@@ -2081,6 +2127,16 @@ Anti-leakage contract
   validation pass never goes through the loss, and the tracker ignores calls made without autograd.
 * Temperature scaling only rescales logits; it cannot repair a biased prior by itself (KHÔNG CHẮC how much it
   helps the nnPU term: an empirical question).
+
+Safeguards added in V1.5 (preflight)
+------------------------------------
+* Temperature floor ``T >= T_MIN_DEFAULT = 0.5``. The PU term sees ``logits / T``; a refit with T < 0.5 (0.307 was
+  observed after 3 epochs, and at T = 0.25 every U row lost its gradient) is CLAMPED up to 0.5. Trade-off: a little
+  calibration sharpness is given up to keep the gradient signal on U. The raw (pre-clamp) value is kept in
+  ``last_raw_temperature`` and every clamp increments ``floor_hits`` (report them in Threats to Validity).
+* The unlabeled prior is clipped only by the numerical ``PRIOR_EPS`` bound. No floor is calibrated from hidden
+  fraud prevalence or any other oracle information. If the train-only estimate is negative, the returned value is
+  ``PRIOR_EPS`` and the raw estimate should be retained in diagnostics / sensitivity analysis.
 """
 from __future__ import annotations
 
@@ -2095,6 +2151,8 @@ from torch import Tensor
 from src.losses import PNU_P, PNU_U
 
 PRIOR_EPS: float = 1e-4
+T_MIN_DEFAULT: float = 0.5           # temperature floor (see module docstring)
+T_MAX_DEFAULT: float = 4.0
 
 
 @dataclass(frozen=True)
@@ -2169,12 +2227,30 @@ def young_counts(
     return int((young & (pnu == PNU_P)).sum()), int((young & (pnu == PNU_U)).sum())
 
 
-def unlabeled_prior(pi_population: float, n_pos_young: int, n_unl_young: int, eps: float = PRIOR_EPS) -> float:
-    """Positive prior inside the young unlabeled set: ``(pi * (n_P + n_U) - n_P) / n_U``, clipped to (0, 1)."""
+def unlabeled_prior_raw(pi_population: float, n_pos_young: int, n_unl_young: int) -> float:
+    """Unclipped ``(pi * (n_P + n_U) - n_P) / n_U``; can be <= 0 (diagnostic: how far the pooled prior is off)."""
     if n_unl_young <= 0:
         raise ValueError("No unlabeled young rows: cannot convert the prior.")
-    hidden = pi_population * (n_pos_young + n_unl_young) - n_pos_young
-    return _clip(hidden / n_unl_young, eps)
+    return (pi_population * (n_pos_young + n_unl_young) - n_pos_young) / n_unl_young
+
+
+def unlabeled_prior(
+    pi_population: float,
+    n_pos_young: int,
+    n_unl_young: int,
+    eps: float = PRIOR_EPS,
+    min_prior: float = PRIOR_EPS,
+) -> float:
+    """Positive prior inside the young unlabeled set, bounded only by a numerical epsilon.
+
+    ``min_prior`` is retained as an explicit caller override for controlled sensitivity checks. Its default is
+    ``PRIOR_EPS``; no empirical/hidden fraud-rate floor is applied. Set it to 0.0 to rely solely on ``eps``.
+    """
+    if not 0.0 <= min_prior < 1.0:
+        raise ValueError("min_prior must be in [0, 1).")
+    raw = unlabeled_prior_raw(pi_population, n_pos_young, n_unl_young)
+    return _clip(max(raw, min_prior), eps)
+
 
 class SlidingWindowPrior:
     """pi as a function of a row's age (days before the label cut), from MATURE TRAIN rows only (observed labels).
@@ -2233,6 +2309,7 @@ class SlidingWindowPrior:
         """pi per age; ages beyond the table reuse the last bin (empty window -> global prior)."""
         idx = (age_days.reshape(-1).float() / self.bin_days).floor().long().clamp(0, self.table.numel() - 1)
         return self.table.to(age_days.device)[idx]
+
 
 class TemperatureScaler(nn.Module):
     """One positive scalar ``T``: calibrated logit = logit / T. ``T`` is stored as ``exp(log_t)`` so it stays > 0."""
@@ -2299,13 +2376,17 @@ class MatureTemperatureTracker:
     ``T = init_temperature``. Logits come from the training pass (dropout on), so ``T`` is slightly stale and
     noisy (limitation, KHÔNG CHẮC). Validation data cannot reach this object: nothing but the loss feeds it.
     The tracker is a plain object (not an ``nn.Module``), so it stays on the CPU and is never in an optimizer.
+
+    ``T`` is clamped to ``[t_min, t_max]`` after every refit (default ``[0.5, 4.0]``). When the fitted value is
+    below ``t_min`` it is raised to ``t_min``: ``last_raw_temperature`` keeps the fitted value and ``floor_hits``
+    counts how often this happened.
     """
 
     def __init__(
         self,
         max_samples: int = 200_000,
-        t_min: float = 0.25,
-        t_max: float = 4.0,
+        t_min: float = T_MIN_DEFAULT,
+        t_max: float = T_MAX_DEFAULT,
         init_temperature: float = 1.0,
     ) -> None:
         if max_samples < 2 or not 0 < t_min <= init_temperature <= t_max:
@@ -2313,6 +2394,8 @@ class MatureTemperatureTracker:
         self.max_samples = int(max_samples)
         self.t_min, self.t_max = float(t_min), float(t_max)
         self.scaler = TemperatureScaler(init_temperature)
+        self.last_raw_temperature: float | None = None  # fitted T before the clamp (diagnostic)
+        self.floor_hits: int = 0                        # number of refits clamped up to t_min
         self._z: list[Tensor] = []
         self._y: list[Tensor] = []
         self._n = 0
@@ -2351,6 +2434,10 @@ class MatureTemperatureTracker:
         if z.numel() == 0 or n_pos == 0 or n_pos == z.numel():
             return self.temperature
         self.scaler.fit(z, y)
+        raw = self.scaler.temperature
+        self.last_raw_temperature = raw
+        if raw < self.t_min:
+            self.floor_hits += 1
         with torch.no_grad():
             self.scaler.log_t.clamp_(math.log(self.t_min), math.log(self.t_max))
         return self.temperature
@@ -2364,8 +2451,9 @@ def calibrated_prior(logits_unlabeled: Tensor, scaler: TemperatureScaler, eps: f
 
 
 __all__ = [
-    "PriorEstimate", "sliding_window_prior", "young_counts", "unlabeled_prior", "TemperatureScaler",
-    "TemperatureScaling", "MatureTemperatureTracker", "SlidingWindowPrior", "calibrated_prior", "PRIOR_EPS",
+    "PriorEstimate", "sliding_window_prior", "young_counts", "unlabeled_prior", "unlabeled_prior_raw",
+    "TemperatureScaler", "TemperatureScaling", "MatureTemperatureTracker", "SlidingWindowPrior",
+    "calibrated_prior", "PRIOR_EPS", "T_MIN_DEFAULT", "T_MAX_DEFAULT",
 ]
 
 ================================================================================
@@ -2380,8 +2468,10 @@ Invariants checked
   * naive_bce     : every U row has a NON-zero gradient (U is read as negative).
   * maturity_mask : every U row has exactly ZERO gradient and the loss value does not change when U
                     logits change.
-  * tw_nndf       : U rows have zero gradient ONLY while the negative-risk clamp is active
-                    (``neg_risk_raw < 0``); outside that regime the U gradient is non-zero by design.
+  * tw_nndf       : in clamp mode, negative raw negative-risk is clamped and its U contribution has zero
+                    gradient. In nnPU mode, a negative raw risk is NOT itself a clamp: when ``neg_risk_raw <
+                    -beta`` the ascent branch is used and U gradients remain active. The trainer reports
+                    negative-risk, nnPU-ascent and zero-PU batch rates separately.
   * model         : logits do not depend on label fields (y_obs, y_true, pnu) of the batch.
 """
 from __future__ import annotations
@@ -3001,12 +3091,14 @@ class TimeWindowNNDFLoss(nn.Module):
 
 
 class HybridTWnnDFLoss(TimeWindowNNDFLoss):
-    """``bce + lambda_pu * pu`` as described in the module docstring.
+    """Maturity-masked BCE + lambda_pu * nnPU.
 
-    Extra args: ``lambda_pu`` (>= 0), ``amount_threshold`` (p95 of the TRAIN amounts from the trainer; ``None``
-    disables amount-aware masking), ``amount_min_age_days``, ``calibrator`` (``MatureTemperatureTracker`` or
-    ``None``), ``sliding_prior`` (object with ``query(age_days)``, e.g. ``SlidingWindowPrior``; ``None`` -> the
-    fixed scalar ``prior``).
+    V2 additions:
+      - bce_pos_weight: positive-class weight in the BCE term only.
+      - u_conf_filter: retain only confident U rows in the PU term.
+      - u_conf_hi / u_conf_lo: confidence thresholds; 0 < lo < hi < 1.
+
+    Defaults preserve the V1.5 loss behavior.
     """
 
     def __init__(
@@ -3025,29 +3117,61 @@ class HybridTWnnDFLoss(TimeWindowNNDFLoss):
         amount_min_age_days: float = 0.0,
         calibrator: Any | None = None,
         sliding_prior: AgePrior | None = None,
+        bce_pos_weight: float = 1.0,
+        u_conf_filter: bool = False,
+        u_conf_hi: float = 0.80,
+        u_conf_lo: float = 0.10,
     ) -> None:
         if tuple(unlabeled_statuses) != ("U",):
-            raise ValueError("hybrid variant: unlabeled_statuses must be ('U',) (N feeds the BCE term).")
-        super().__init__(prior, unlabeled_statuses, mode, beta, gamma, amount_weighted, amount_ref, max_weight)
+            raise ValueError(
+                "hybrid variant: unlabeled_statuses must be ('U',) (N feeds the BCE term)."
+            )
+
+        super().__init__(
+            prior, unlabeled_statuses, mode, beta, gamma,
+            amount_weighted, amount_ref, max_weight,
+        )
+
         if lambda_pu < 0:
             raise ValueError("lambda_pu must be >= 0.")
         if amount_threshold is not None and amount_threshold <= 0:
             raise ValueError("amount_threshold must be > 0.")
         if amount_min_age_days < 0:
             raise ValueError("amount_min_age_days must be >= 0.")
+        if bce_pos_weight <= 0:
+            raise ValueError("bce_pos_weight must be > 0.")
+        if not 0.0 < u_conf_lo < u_conf_hi < 1.0:
+            raise ValueError("need 0 < u_conf_lo < u_conf_hi < 1.")
+
         self.lambda_pu = float(lambda_pu)
-        self.amount_threshold = None if amount_threshold is None else float(amount_threshold)
+        self.amount_threshold = (
+            None if amount_threshold is None else float(amount_threshold)
+        )
         self.amount_min_age_days = float(amount_min_age_days)
         self.calibrator = calibrator
         self.sliding_prior = sliding_prior
+
+        self.bce_pos_weight = float(bce_pos_weight)
+        self.u_conf_filter = bool(u_conf_filter)
+        self.u_conf_hi = float(u_conf_hi)
+        self.u_conf_lo = float(u_conf_lo)
 
     @property
     def needs_amount(self) -> bool:
         return self.amount_weighted or self.amount_threshold is not None
 
     def end_epoch(self) -> float | None:
-        """Called by the trainer after each training epoch: refit ``T`` on the TRAIN rows collected so far."""
+        """Refit temperature using mature TRAIN rows collected during this epoch."""
         return None if self.calibrator is None else self.calibrator.refit()
+
+    def _bce(self, logits: Tensor, target: Tensor) -> Tensor:
+        # Preserve the original V1.5 numerical path when pos_weight == 1.
+        if self.bce_pos_weight == 1.0:
+            return F.binary_cross_entropy_with_logits(logits, target)
+
+        return nn.BCEWithLogitsLoss(
+            pos_weight=logits.new_tensor(self.bce_pos_weight)
+        )(logits, target)
 
     def forward(
         self,
@@ -3059,50 +3183,136 @@ class HybridTWnnDFLoss(TimeWindowNNDFLoss):
         in_train_view: Tensor | None = None,
         amount: Tensor | None = None,
     ) -> Tensor:
-        preds, _, pnu, view = prepare_inputs(preds, y_obs, pnu_status, in_train_view)
+        preds, _, pnu, view = prepare_inputs(
+            preds, y_obs, pnu_status, in_train_view
+        )
         amt = None if amount is None else amount.reshape(-1).to(preds.device)
+
+        # ---- trusted negatives ------------------------------------------------
         trusted = torch.zeros_like(view)
         if self.amount_threshold is not None:
             if amt is None:
                 raise ValueError("amount_threshold is set: `amount` is required.")
             trusted = view & trusted_negative_mask(
-                pnu, amt, age_days, self.amount_threshold, self.amount_min_age_days
+                pnu, amt, age_days,
+                self.amount_threshold,
+                self.amount_min_age_days,
             )
 
-        # ---- BCE on the mature region: P=1, N=0, trusted U=0 ------------------------------------------------
+        # ---- BCE: P=1, N=0, trusted-U=0 --------------------------------------
         is_pos = view & (pnu == PNU_P)
-        keep = is_pos | (view & (pnu == PNU_N)) | trusted
-        has_keep = bool(keep.any())
-        bce = (
-            F.binary_cross_entropy_with_logits(preds[keep], is_pos[keep].to(preds.dtype))
-            if has_keep else zero_loss(preds)
-        )
-        if self.calibrator is not None and has_keep and self.training and torch.is_grad_enabled():
-            self.calibrator.collect(preds[keep].detach(), is_pos[keep])  # TRAIN mature rows only
+        keep_bce = is_pos | (view & (pnu == PNU_N)) | trusted
 
-        # ---- nnPU on P versus the remaining U, on calibrated logits -----------------------------------------
-        z = preds if self.calibrator is None else preds / self.calibrator.temperature
-        pnu_pu = torch.where(trusted, torch.full_like(pnu, PNU_N), pnu)  # trusted rows leave U
+        if bool(keep_bce.any()):
+            bce = self._bce(
+                preds[keep_bce],
+                is_pos[keep_bce].to(preds.dtype),
+            )
+        else:
+            bce = zero_loss(preds)
+
+        if (
+            self.calibrator is not None
+            and bool(keep_bce.any())
+            and self.training
+            and torch.is_grad_enabled()
+        ):
+            self.calibrator.collect(
+                preds[keep_bce].detach(),
+                is_pos[keep_bce],
+            )
+
+        # ---- PU: P versus remaining U, optionally calibrated -----------------
+        z = (
+            preds
+            if self.calibrator is None
+            else preds / self.calibrator.temperature
+        )
+
+        # Trusted U rows are treated as N for BCE and removed from PU.
+        pnu_pu = torch.where(
+            trusted,
+            torch.full_like(pnu, PNU_N),
+            pnu,
+        )
+        view_pu = view
+
+        u_raw = view & (pnu == PNU_U)
+        u_remaining = view & (pnu_pu == PNU_U)
+        u_kept = u_remaining
+
+        if self.u_conf_filter:
+            # Detach the selection decision: no gradient through the mask.
+            confidence = z.detach().sigmoid()
+            confident = (
+                (confidence > self.u_conf_hi)
+                | (confidence < self.u_conf_lo)
+            )
+            u_kept = u_remaining & confident
+
+            # Mask only U rows in the grey zone. P rows remain in PU.
+            view_pu = view & ~(u_remaining & ~confident)
+
+        n_u_remaining = u_remaining.sum().to(preds.dtype)
+        n_u_kept = u_kept.sum().to(preds.dtype)
+        kept_frac = torch.where(
+            n_u_remaining > 0,
+            n_u_kept / n_u_remaining.clamp_min(1.0),
+            preds.new_zeros(()),
+        )
+
+        # ---- Sliding prior on the actual U rows entering this PU batch -------
         pi: Tensor | None = None
         if self.sliding_prior is not None:
             if age_days is None:
                 raise ValueError("sliding_prior is set: `age_days` is required.")
-            u_rows = view & (pnu_pu == PNU_U)
-            if bool(u_rows.any()):
-                age_u = age_days.reshape(-1).to(preds.device)[u_rows]
-                pi = self.sliding_prior.query(age_u).to(preds.dtype).mean().clamp(_PRIOR_EPS, 1.0 - _PRIOR_EPS)
-        parts = self.risks(z, y_obs, pnu_pu, in_train_view, amt, prior=pi)
-        zero = preds.detach().sum() * 0.0
+
+            if bool(u_kept.any()):
+                age_u = age_days.reshape(-1).to(preds.device)[u_kept]
+                pi = (
+                    self.sliding_prior.query(age_u)
+                    .to(preds.dtype)
+                    .mean()
+                    .clamp(_PRIOR_EPS, 1.0 - _PRIOR_EPS)
+                )
+
+        parts = self.risks(
+            z, y_obs, pnu_pu, view_pu, amt, prior=pi
+        )
+
+        # Connected zero is essential when confidence filtering removes all U
+        # (or when P/U is otherwise absent in this batch).
         if parts is None:
-            pu = zero
-            risks = {k: zero for k in ("pos_risk", "neg_risk_raw", "neg_risk", "clamped", "ascent", "prior_used")}
+            pu = zero_loss(preds)
+            zero = preds.new_zeros(())
+            risks = {
+                "pos_risk": zero,
+                "neg_risk_raw": zero,
+                "neg_risk": zero,
+                "clamped": zero,
+                "ascent": zero,
+                "prior_used": (
+                    preds.new_tensor(self.prior) if pi is None else pi
+                ).detach(),
+            }
         else:
             pu, ascent = self._pu_loss(parts)
             risks = {k: v.detach() for k, v in parts.items()}
             risks["ascent"] = ascent.detach()
-            risks["prior_used"] = (preds.new_tensor(self.prior) if pi is None else pi).detach()
-        risks["bce"] = bce.detach()
+            risks["prior_used"] = (
+                preds.new_tensor(self.prior) if pi is None else pi
+            ).detach()
+
+        risks.update({
+            "bce": bce.detach(),
+            "pu_loss": pu.detach(),
+            "u_raw_count": u_raw.sum().to(preds.dtype).detach(),
+            "u_pu_count": u_remaining.sum().to(preds.dtype).detach(),
+            "u_kept_count": n_u_kept.detach(),
+            "u_kept_frac": kept_frac.detach(),
+        })
         self.last_risks = risks
+
         return bce + self.lambda_pu * pu
 
 
@@ -3493,15 +3703,12 @@ from src.losses.calibration import (
     MatureTemperatureTracker, SlidingWindowPrior, sliding_window_prior, unlabeled_prior, young_counts,
 )
 from src.losses.maturity_mask import MaturityMaskLoss
-from src.losses.tw_nndf import HybridTWnnDFLoss, TimeWindowNNDFLoss, estimate_class_prior
-from src.losses.tw_nndf import HybridTWnnDFLoss
+from src.losses.tw_nndf import HybridTWnnDFLoss, TimeWindowNNDFLoss
 from src.data.dataset import load_phase_datasets, read_meta, seed_labels
 from src.eval import metrics as M
 from src.graph.builder import PNU_CODES, TXN
-from src.losses.tw_nndf import HybridTWnnDFLoss, TimeWindowNNDFLoss
 from src.losses import (
-    NaiveBCELoss, TimeWindowNNDFLoss, build_loss, compute_age_days, estimate_class_prior,
-    lam_from_median_delay,
+    NaiveBCELoss, build_loss, compute_age_days, estimate_class_prior, lam_from_median_delay,
 )
 from src.losses import DelayIPWLoss
 from src.models.classifier import FraudClassifier, entity_vocab_sizes_from_meta
@@ -3512,9 +3719,15 @@ from src.train.utils import (
 
 LOSS_NAMES = ("naive_bce", "maturity_mask", "delay_ipw", "tw_nndf")
 MONITORS = ("pr_auc", "roc_auc", "recall_at_fpr")
-NNDF_KEYS = ("pos_risk", "neg_risk_raw", "clamped", "ascent", "bce")
+V2_KEYS = ("bce_pos_weight", "u_conf_filter", "u_conf_hi", "u_conf_lo")
+NNDF_KEYS = (
+    "pos_risk", "neg_risk_raw", "neg_risk", "clamped",
+    "ascent", "bce", "pu_loss", "prior_used",
+    "u_raw_count", "u_pu_count", "u_kept_count", "u_kept_frac",
+)
 PRIOR_MODES = ("mature_mean", "sliding_window", "sliding_unlabeled", "sliding_dynamic")
 AMOUNT_KEYS = ("amount_aware", "amount_quantile", "amount_min_age_days")
+
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -3637,6 +3850,8 @@ def build_training_loss(cfg: TrainConfig, train_ds: Any, meta: Mapping[str, Any]
         lambda_pu = float(params.pop("lambda_pu", 1.0))
         calib_cfg = dict(params.pop("calibration", None) or {})
         aw = {k: params.pop(k) for k in AMOUNT_KEYS if k in params}
+        v2 = {k: params.pop(k) for k in V2_KEYS if k in params}
+
         if prior_mode not in PRIOR_MODES:
             raise ValueError(f"prior_mode must be one of {PRIOR_MODES}.")
         if variant not in ("pu_only", "hybrid"):
@@ -3644,16 +3859,23 @@ def build_training_loss(cfg: TrainConfig, train_ds: Any, meta: Mapping[str, Any]
         if "unlabeled_statuses" in params:
             params["unlabeled_statuses"] = tuple(params["unlabeled_statuses"])
 
-        est = estimate_class_prior(full.y_obs, age_all, window, full.in_train_view)  # observed labels only
-        prior_auto = est
-        info.update(prior_estimated=est)
-        if prior_mode != "mature_mean":
-            sw = sliding_window_prior(full.y_obs, age_all, window, in_train_view=full.in_train_view,
-                                      span_days=span_days, n_windows=n_windows)
-            prior_auto = sw.prior  # sliding_dynamic uses it as the fallback scalar
-            info.update(prior_sliding=sw.prior, prior_window_rates=list(sw.window_rates),
-                        prior_window_counts=list(sw.window_counts))
-            if prior_mode == "sliding_unlabeled":
+        est = estimate_class_prior(full.y_obs, age_all, window, full.in_train_view)
+        prior_auto = float(est)
+        info.update(
+            prior_estimated=prior_auto,     
+        )
+
+        if prior_mode == "mature_mean":
+            prior_auto = prior_auto
+        elif prior_mode in ("sliding_window", "sliding_unlabeled"):
+            sw = sliding_window_prior(
+                full.y_obs, age_all, window, in_train_view=full.in_train_view,
+                span_days=span_days, n_windows=n_windows,
+            )
+            if prior_mode == "sliding_window":
+                prior_auto = float(sw.prior)
+                info.update(prior_window_rates=list(sw.window_rates), prior_window_counts=list(sw.window_counts))
+            else:
                 if tuple(params.get("unlabeled_statuses", ("U",))) != ("U",):
                     raise ValueError("prior_mode='sliding_unlabeled' needs unlabeled_statuses == ['U'].")
                 n_p, n_u = young_counts(full.pnu, age_all, window, full.in_train_view)
@@ -3677,8 +3899,11 @@ def build_training_loss(cfg: TrainConfig, train_ds: Any, meta: Mapping[str, Any]
             info.update(prior_dynamic_min=float(sp.table.min()), prior_dynamic_max=float(sp.table.max()))
         tracker = MatureTemperatureTracker(**calib_cfg) if bool(calib_cfg.pop("enabled", True)) else None
         info.update(lambda_pu=lambda_pu, calibration=tracker is not None)
+
+        info.update(**{f"v2_{k}": v for k, v in v2.items()})
         return HybridTWnnDFLoss(prior=prior, lambda_pu=lambda_pu, amount_threshold=thr,
-                                amount_min_age_days=min_age, calibrator=tracker, sliding_prior=sp, **params), info
+                                amount_min_age_days=min_age, calibrator=tracker, sliding_prior=sp,
+                                **v2, **params), info
 
     if cfg.loss == "delay_ipw":
         lam = params.pop("lam", None)
@@ -3690,46 +3915,42 @@ def build_training_loss(cfg: TrainConfig, train_ds: Any, meta: Mapping[str, Any]
     return build_loss(cfg.loss, **params), info
 
 
-def compute_batch_loss(
-    model: nn.Module, loss_fn: nn.Module, batch: Any, label_cut: float, oracle: bool
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Forward + loss on the seed rows of one batch (shared with scripts/profile_epoch.py)."""
-    labels = seed_labels(batch)
-    if oracle:
-        if "y_true" not in labels:
-            raise KeyError("Oracle run needs y_true in the train batches (expose_train_true_labels=True).")
-        y = labels["y_true"]
-    else:
-        y = labels["y_obs"]
-    age = compute_age_days(labels["time"], label_cut)
-    kwargs: dict[str, Any] = {"age_days": age, "in_train_view": labels["in_train_view"]}
-    if getattr(loss_fn, "needs_amount", False):  # amount-aware masking / cost-sensitive nnDF only
-        if "amount" not in labels:
-            raise KeyError("This loss needs `amount` in the batches.")
-        kwargs["amount"] = labels["amount"]
-    logits = model(batch)
-    loss = loss_fn(logits, y, labels["pnu"], **kwargs)
-    return loss, logits
-
-
 # --------------------------------------------------------------------------- #
 # One step / prediction
 # --------------------------------------------------------------------------- #
 def compute_batch_loss(
-    model: nn.Module, loss_fn: nn.Module, batch: Any, label_cut: float, oracle: bool
+    model: nn.Module,
+    loss_fn: nn.Module,
+    batch: Any,
+    label_cut: float,
+    oracle: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Forward + loss on the seed rows of one batch (shared with scripts/profile_epoch.py)."""
+    """Forward + loss on the seed rows of one batch."""
     labels = seed_labels(batch)
+
     if oracle:
         if "y_true" not in labels:
-            raise KeyError("Oracle run needs y_true in the train batches (expose_train_true_labels=True).")
+            raise KeyError(
+                "Oracle run needs y_true in the train batches "
+                "(expose_train_true_labels=True)."
+            )
         y = labels["y_true"]
     else:
         y = labels["y_obs"]
+
     age = compute_age_days(labels["time"], label_cut)
+    kwargs: dict[str, Any] = {
+        "age_days": age,
+        "in_train_view": labels["in_train_view"],
+    }
+
+    if getattr(loss_fn, "needs_amount", False):
+        if "amount" not in labels:
+            raise KeyError("This loss needs `amount` in the batches.")
+        kwargs["amount"] = labels["amount"]
+
     logits = model(batch)
-    extra = {"amount": labels["amount"]} if getattr(loss_fn, "needs_amount", False) else {}
-    loss = loss_fn(logits, y, labels["pnu"], age_days=age, in_train_view=labels["in_train_view"], **extra)
+    loss = loss_fn(logits, y, labels["pnu"], **kwargs)
     return loss, logits
 
 
@@ -3778,6 +3999,37 @@ class Trainer:
         self._is_nndf = isinstance(loss_fn, TimeWindowNNDFLoss)
 
     # ---- one epoch ---------------------------------------------------------- #
+    def _has_valid_pu_batch(
+    self, batch: Any, risks: Mapping[str, torch.Tensor] | None
+) -> bool:
+        """Whether this batch contributed a non-empty P/U objective after filtering."""
+        if risks is None:
+            return False
+        store = batch[TXN]
+        pnu_all = store.pnu.reshape(-1)
+        # Losses receive seed labels only (`seed_labels`); history nodes must not enter
+        # this batch-level P/U availability diagnostic.
+        batch_size = int(store.batch_size) if "batch_size" in store else pnu_all.numel()
+        pnu = pnu_all[:batch_size]
+        view_all = store.get("in_train_view")
+        if view_all is None:
+            view = torch.ones_like(pnu, dtype=torch.bool)
+        else:
+            view = view_all.reshape(-1).bool()[:batch_size]
+
+        has_p = bool((view & (pnu == PNU_CODES["P"])).any())
+        statuses = tuple(getattr(self.loss_fn, "unlabeled_statuses", ("U",)))
+        u_codes = torch.as_tensor(
+            [PNU_CODES[s] for s in statuses], dtype=pnu.dtype, device=pnu.device
+        )
+        has_u = bool((view & torch.isin(pnu, u_codes)).any())
+
+        # Hybrid loss reports the count remaining after trusted-U and confidence filtering.
+        if "u_kept_count" in risks:
+            has_u = float(risks["u_kept_count"]) > 0.0
+        return has_p and has_u
+
+    # ---- one epoch ---------------------------------------------------------- #
     def train_epoch(self) -> dict[str, float]:
         cfg, dev = self.cfg, self.device
         self.model.train()
@@ -3786,6 +4038,9 @@ class Trainer:
         loss_sum = torch.zeros((), device=dev)
         risk_sum = {k: torch.zeros((), device=dev) for k in NNDF_KEYS}
         n_used = n_empty = 0
+        nndf_batches = n_pu_valid_batches = 0
+        negative_risk_batches = nnpu_ascent_batches = zero_pu_batches = 0
+
         for step, batch in enumerate(self.train_ds):
             if cfg.max_train_batches is not None and step >= cfg.max_train_batches:
                 break
@@ -3797,32 +4052,75 @@ class Trainer:
 
             loss, _ = compute_batch_loss(self.model, self.loss_fn, batch, self.label_cut, cfg.oracle)
             self.opt.zero_grad(set_to_none=True)
-            if self._is_nndf and self.loss_fn.last_risks is None:  # no P or no U in this batch
+
+            risks = self.loss_fn.last_risks if self._is_nndf else None
+            if self._is_nndf:
+                nndf_batches += 1
+                if self._has_valid_pu_batch(batch, risks):
+                    n_pu_valid_batches += 1
+                    raw = risks.get("neg_risk_raw")
+                    ascent = risks.get("ascent")
+                    if raw is not None and float(raw) < 0.0:
+                        negative_risk_batches += 1
+                    if ascent is not None and float(ascent) > 0.0:
+                        nnpu_ascent_batches += 1
+                else:
+                    zero_pu_batches += 1
+
+            if self._is_nndf and risks is None:  # pu_only: no P or no U in this batch
                 n_empty += 1
                 continue
+
             loss.backward()
             if cfg.grad_clip is not None:
                 nn.utils.clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
             self.opt.step()
             loss_sum += loss.detach()
             n_used += 1
-            if self._is_nndf:  # tensors accumulated on device: no GPU sync per step
-                for k in NNDF_KEYS:
-                    risk_sum[k] += self.loss_fn.last_risks.get(k, loss_sum.new_zeros(())).to(dev)  # pu_only has no "bce"
-        elapsed = sw.stop()
 
+            if self._is_nndf and risks is not None:
+                for k in NNDF_KEYS:
+                    value = risks.get(k)
+                    if value is not None:
+                        risk_sum[k] += value.to(dev)
+
+        elapsed = sw.stop()
         denom = max(n_used, 1)
         mean_loss = float(loss_sum) / denom
         if not math.isfinite(mean_loss):
             raise FloatingPointError("Training loss is not finite: training diverged.")
-        out = {"train_loss": mean_loss, "n_steps": float(n_used), "n_empty_batches": float(n_empty),
-               "lr_end": float(self.opt.param_groups[0]["lr"]), "train_sec": elapsed}
+        out = {
+            "train_loss": mean_loss, "n_steps": float(n_used), "n_empty_batches": float(n_empty),
+            "lr_end": float(self.opt.param_groups[0]["lr"]), "train_sec": elapsed,
+        }
+
         if self._is_nndf:
-            out.update({"nndf_pos_risk": float(risk_sum["pos_risk"]) / denom,
-                        "nndf_neg_risk_raw": float(risk_sum["neg_risk_raw"]) / denom,
-                        "nndf_clamped_rate": float(risk_sum["clamped"]) / denom,
-                        "nndf_bce": float(risk_sum["bce"]) / denom,
-                        "nndf_ascent_rate": float(risk_sum["ascent"]) / denom})
+            valid_denom = max(n_pu_valid_batches, 1)
+            total_denom = max(nndf_batches, 1)
+            negative_risk_rate = negative_risk_batches / valid_denom
+            nnpu_ascent_rate = nnpu_ascent_batches / valid_denom
+            zero_pu_rate = zero_pu_batches / total_denom
+            out.update({
+                "nndf_pos_risk": float(risk_sum["pos_risk"]) / denom,
+                "nndf_neg_risk_raw": float(risk_sum["neg_risk_raw"]) / denom,
+                "nndf_neg_risk": float(risk_sum["neg_risk"]) / denom,
+                # `clamped` in the loss is only the event (negative raw risk), not necessarily
+                # an objective clamp: nnPU uses its ascent branch when raw < -beta.
+                "nndf_negative_risk_rate": negative_risk_rate,
+                "nndf_ascent_rate": nnpu_ascent_rate,
+                "nndf_zero_pu_rate": zero_pu_rate,
+                # Backward-compatible alias consumed by existing benchmark reporting.
+                "nndf_clamped_rate": negative_risk_rate,
+                "nndf_bce": float(risk_sum["bce"]) / denom,
+                "nndf_pu_loss": float(risk_sum["pu_loss"]) / denom,
+                "nndf_prior_used": float(risk_sum["prior_used"]) / denom,
+                "nndf_u_raw_count": float(risk_sum["u_raw_count"]) / denom,
+                "nndf_u_pu_count": float(risk_sum["u_pu_count"]) / denom,
+                "nndf_u_kept_count": float(risk_sum["u_kept_count"]) / denom,
+                "nndf_u_kept_frac": float(risk_sum["u_kept_frac"]) / denom,
+                "nndf_pu_valid_batches": float(n_pu_valid_batches),
+                "nndf_batches": float(nndf_batches),
+            })
         return out
 
     # ---- evaluation ---------------------------------------------------------- #
@@ -3831,11 +4129,29 @@ class Trainer:
         return M.summarize_scores(out["y_true"], out["scores"], fpr=self.cfg.fpr), out
 
     def evaluate_test(self, test_ds: Any, threshold: float) -> dict[str, float]:
-        """Score the test set ONCE with the threshold fitted on validation."""
-        m, out = self.evaluate(test_ds)
-        op = M.operating_point(out["y_true"], out["scores"], out["amount"], threshold,
-                               review_cost=self.cfg.review_cost)
-        return {**m, **{f"op_{k}": v for k, v in op.items()}}
+        """Evaluate test ranking metrics and apply ONLY the threshold fitted on validation.
+
+        Do not call ``self.evaluate`` here: ``summarize_scores`` also fits a threshold on the
+        supplied labels, which would make a test-set Recall@FPR an oracle operating point.
+        """
+        if math.isnan(float(threshold)):
+            raise ValueError("Validation threshold must not be NaN.")
+        out = predict(self.model, test_ds, self.device)
+        y_true, scores, amount = out["y_true"], out["scores"], out["amount"]
+        pr_auc = M.average_precision(y_true, scores)
+        roc = M.roc_auc(y_true, scores)
+        op = M.operating_point(
+            y_true, scores, amount, float(threshold), review_cost=self.cfg.review_cost
+        )
+        return {
+            "pr_auc": pr_auc,
+            "roc_auc": roc,
+            # This is Recall/FPR at the validation-fitted threshold, not a test-fitted threshold.
+            "recall_at_fpr": op["recall"],
+            "fpr_at_valthr": op["fpr"],
+            "val_threshold_applied": float(threshold),
+            **{f"op_{k}": v for k, v in op.items()},
+        }
 
     # ---- full training run ---------------------------------------------------- #
     def fit(self) -> dict[str, Any]:
@@ -3849,6 +4165,14 @@ class Trainer:
 
         for epoch in range(1, cfg.epochs + 1):
             tr = self.train_epoch()
+            end = getattr(self.loss_fn, "end_epoch", None)      # HybridTWnnDFLoss only: refit T on TRAIN rows
+            if end is not None:
+                t_new = end()
+                if t_new is not None:
+                    tr["calib_T"] = float(t_new)                 # shown as T= in the epoch log
+                    cal = getattr(self.loss_fn, "calibrator", None)
+                    if cal is not None and cal.last_raw_temperature is not None:
+                        tr["calib_T_raw"] = float(cal.last_raw_temperature)   # pre-clamp value
             va, _ = self.evaluate(self.val_ds)
             improved = stopper.update(va[cfg.monitor], epoch)
             if improved:
@@ -3859,9 +4183,14 @@ class Trainer:
                                Path(cfg.save_dir) / "best.pt")
             history.append({"epoch": float(epoch), **tr, "val_pr_auc": va["pr_auc"],
                             "val_roc_auc": va["roc_auc"], "val_recall_at_fpr": va["recall_at_fpr"]})
-            extra = (f" | nndf neg_raw={tr['nndf_neg_risk_raw']:+.4f} clamped={tr['nndf_clamped_rate']:.2f}"
-                     f" ascent={tr['nndf_ascent_rate']:.2f} bce={tr['nndf_bce']:.4f} T={tr.get('calib_T', float('nan')):.3f}"
-                     f" empty={int(tr['n_empty_batches'])}") if self._is_nndf else ""
+            extra = (
+                f" | nndf neg_raw={tr['nndf_neg_risk_raw']:+.4f}"
+                f" negative_risk_rate={tr['nndf_negative_risk_rate']:.2f}"
+                f" ascent_rate={tr['nndf_ascent_rate']:.2f}"
+                f" zero_pu_rate={tr['nndf_zero_pu_rate']:.2f}"
+                f" bce={tr['nndf_bce']:.4f} T={tr.get('calib_T', float('nan')):.3f}"
+                f" empty={int(tr['n_empty_batches'])}"
+            ) if self._is_nndf else ""
             self.log(f"epoch {epoch:>2} loss={tr['train_loss']:.4f} val_prauc={va['pr_auc']:.4f} "
                      f"val_auc={va['roc_auc']:.4f} val_rec@fpr={va['recall_at_fpr']:.4f} "
                      f"{'*' if improved else ' '} ({tr['train_sec']:.0f}s){extra}")
@@ -3947,7 +4276,7 @@ def run_one(
         "best_epoch": fit["best_epoch"], "epochs_run": fit["epochs_run"],
         "val_pr_auc": fit["val"]["pr_auc"], "val_roc_auc": fit["val"]["roc_auc"],
         "test_pr_auc": test["pr_auc"], "test_roc_auc": test["roc_auc"],
-        "test_recall_at_fpr": test["recall_at_fpr"],            # own-curve recall at FPR <= fpr
+        "test_recall_at_fpr": test["recall_at_fpr"],            # recall at validation-fitted threshold
         "test_recall_at_valthr": test["op_recall"], "test_fpr_at_valthr": test["op_fpr"],
         "test_efl": test["op_efl"], "test_efl_ratio": test["op_efl_ratio"],
         "train_seconds": fit["train_seconds"],
@@ -4467,6 +4796,481 @@ def main(argv: Sequence[str] | None = None) -> int:
     bundle([fig_dir, out_dir], out_base / "report_bundle.zip")
     print(f"[report] figures -> {fig_dir} | tables/CSV -> {out_dir} | zip -> {out_base / 'report_bundle.zip'}")
     return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+================================================================================
+
+FILE: scripts\preflight_checks.py
+
+================================================================================
+
+#!/usr/bin/env python
+"""Pre-flight checks, one part at a time. Nothing here trains a model.
+
+    python scripts/preflight_checks.py --part 1      # gradient scale bce vs pu, amount weights (dummy data)
+    python scripts/preflight_checks.py --part 2      # T tracker timing / saturation, prior drift table (dummy data)
+    python scripts/preflight_checks.py --part 2 --processed_dir data/processed/delay_high   # + REAL priors (train graph)
+    python scripts/preflight_checks.py --part 3 [--runs_dir results/runs]   # model selection, pos_weight scan
+    python scripts/preflight_checks.py --part 4 --processed_dir data/processed/delay_high   # causality (needs pyg-lib)
+    python scripts/preflight_checks.py --part 5 --base configs/base.yaml --hybrid configs/base_hybrid.yaml
+
+Tags: PASS / WARN (look at it) / FAIL (fix before the full run) / SKIP (input missing).
+Thresholds marked "heuristic" are my own choice (KHÔNG CHẮC), not standards. Exit code 1 if any FAIL.
+The dummy world has NO hidden positives inside U: it isolates the loss mechanics, not real data behaviour.
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import importlib.util
+import json
+import math
+import sys
+import warnings
+from pathlib import Path
+from types import SimpleNamespace
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+import torch
+import yaml
+
+from src.graph.builder import PNU_CODES
+
+P, N, U = PNU_CODES["P"], PNU_CODES["N"], PNU_CODES["U"]
+MISSING = object()
+
+
+class Report:
+    def __init__(self) -> None:
+        self.count = {"PASS": 0, "WARN": 0, "FAIL": 0, "SKIP": 0}
+
+    def add(self, tag: str, msg: str) -> None:
+        self.count[tag] += 1
+        print(f"  [{tag}] {msg}")
+
+
+def _f(x) -> float:
+    return float("nan") if x is None else float(x)
+
+
+# --------------------------------------------------------------------------- #
+# Dummy data
+# --------------------------------------------------------------------------- #
+def make_batch(n: int = 4096, p_rate: float = 0.035, u_frac: float = 0.25, seed: int = 0):
+    g = torch.Generator().manual_seed(seed)
+    n_p, n_u = max(int(n * p_rate), 8), int(n * u_frac)
+    n_n = n - n_p - n_u
+    pnu = torch.cat([torch.full((n_p,), P), torch.full((n_n,), N), torch.full((n_u,), U)]).long()
+    y = (pnu == P).float()
+    age = torch.where(pnu == U, torch.full((n,), 5.0), torch.full((n,), 40.0))
+    view = torch.ones(n, dtype=torch.bool)
+    amt = torch.exp(torch.randn(n, generator=g) * 1.2 + 3.5)
+    amt[torch.randperm(n, generator=g)[:5]] = 1e5          # extreme outliers
+    return pnu, y, age, view, amt
+
+
+def make_logits(pnu: torch.Tensor, kind: str, seed: int = 1) -> torch.Tensor:
+    g = torch.Generator().manual_seed(seed)
+    z = torch.randn(pnu.numel(), generator=g) * 0.05
+    return torch.where(pnu == P, z + 3.0, z - 3.0) if kind == "separated" else z
+
+
+# --------------------------------------------------------------------------- #
+# PART 1: gradient scale of bce vs lambda_pu * pu, amount weights
+# --------------------------------------------------------------------------- #
+def part1(rep: Report, args) -> None:
+    print("PART 1: gradient scale of bce vs lambda_pu * pu; amount weights")
+    try:
+        from src.losses.tw_nndf import HybridTWnnDFLoss as H
+    except ImportError as exc:
+        rep.add("FAIL", f"HybridTWnnDFLoss not importable: {exc}")
+        return
+    pnu, y, age, view, amt = make_batch()
+
+    def grad(fn, z):
+        z = z.clone().requires_grad_(True)
+        loss = fn(z, y, pnu, age_days=age, in_train_view=view, amount=amt)
+        loss.backward()
+        return z.grad.detach(), fn.last_risks
+
+    for prior in args.priors:
+        for kind in ("init", "separated"):
+            z = make_logits(pnu, kind)
+            g_b, _ = grad(H(prior, mode=args.mode, lambda_pu=0.0), z)
+            g_t, r = grad(H(prior, mode=args.mode, lambda_pu=1.0), z)
+            g_pu = g_t - g_b
+            nb, npu = float(g_b.norm()), float(g_pu.norm())
+            ratio = args.lambda_pu * npu / max(nb, 1e-30)
+            u_live = float((g_pu[pnu == U].abs() > 0).float().mean())
+            tag, note = "PASS", ""
+            if npu <= 1e-3 * nb:
+                tag, note = "WARN", " | PU term ~inert (heuristic: < 1e-3 x BCE)"
+            elif ratio > 3.0:
+                tag, note = "WARN", " | PU dominates (heuristic: lambda*PU > 3 x BCE)"
+            rep.add(tag, f"prior={prior:.4f} logits={kind:<9} |g_bce|={nb:.3e} |g_pu|={npu:.3e} "
+                         f"lambda*pu/bce={ratio:.2f} ascent={float(r['ascent']):.0f} clamped={float(r['clamped']):.0f} "
+                         f"U_rows_with_PU_grad={u_live:.0%}{note}")
+
+    try:
+        from src.train.trainer import _amount_ref_mean_one as ref_fn
+    except ImportError:
+        ref_fn = None
+        rep.add("WARN", "trainer._amount_ref_mean_one missing: amount_ref = plain mean (capped weights average < 1)")
+    refs = {"mean": float(amt.mean())}
+    if ref_fn is not None:
+        refs["capped_mean=1"] = ref_fn(amt, args.max_weight)
+    for name, ref in refs.items():
+        w = (amt / ref).clamp(max=args.max_weight)
+        tag = "PASS" if abs(float(w.mean()) - 1.0) < 0.05 else "WARN"
+        capped = float((amt / ref > args.max_weight).float().mean())
+        rep.add(tag, f"amount_ref={name} ({ref:.1f}): mean w={float(w.mean()):.3f} max w={float(w.max()):.1f} "
+                     f"capped rows={capped:.1%}")
+    ref = refs.get("capped_mean=1", refs["mean"])
+    z = make_logits(pnu, "init")
+    g_w, _ = grad(H(args.priors[0], mode=args.mode, lambda_pu=1.0, amount_weighted=True, amount_ref=ref,
+                    max_weight=args.max_weight), z)
+    g_u, _ = grad(H(args.priors[0], mode=args.mode, lambda_pu=1.0), z)
+    ratio = float(g_w.abs().max()) / max(float(g_u.abs().max()), 1e-30)
+    rep.add("PASS" if ratio <= 2 * args.max_weight else "WARN",
+            f"max |row grad| weighted/unweighted = {ratio:.1f} (cap {args.max_weight:g}; heuristic bound 2x cap)")
+
+
+# --------------------------------------------------------------------------- #
+# PART 2: T tracker (timing, saturation) and prior
+# --------------------------------------------------------------------------- #
+def part2(rep: Report, args) -> None:
+    print("PART 2: temperature tracker and prior")
+    try:
+        from src.losses.calibration import MatureTemperatureTracker, unlabeled_prior
+        from src.losses.tw_nndf import HybridTWnnDFLoss as H, TimeWindowNNDFLoss as PU
+    except ImportError as exc:
+        rep.add("FAIL", f"import failed: {exc}")
+        return
+    prior = args.priors[0]
+
+    # 2a: when does T change?
+    torch.manual_seed(0)
+    pnu, y, age, view, amt = make_batch(n=2048)
+    x = torch.randn(pnu.numel(), 8)
+    x[pnu == P] += 1.0
+    lin = torch.nn.Linear(8, 1)
+    opt = torch.optim.Adam(lin.parameters(), lr=1e-2)
+    tracker = MatureTemperatureTracker()
+    loss_fn = H(prior, mode=args.mode, lambda_pu=args.lambda_pu, calibrator=tracker)
+    for epoch in range(1, 4):
+        seen = set()
+        for _ in range(5):
+            seen.add(round(tracker.temperature, 9))
+            opt.zero_grad()
+            loss_fn(lin(x).squeeze(1), y, pnu, age_days=age, in_train_view=view, amount=amt).backward()
+            opt.step()
+        t_old, t_new = tracker.temperature, loss_fn.end_epoch()
+        at_bound = min(abs(t_new - tracker.t_min), abs(t_new - tracker.t_max)) < 1e-6
+        tag = "WARN" if (len(seen) != 1 or at_bound) else "PASS"
+        rep.add(tag, f"epoch {epoch}: T constant inside the epoch={len(seen) == 1} ({t_old:.3f}) -> after refit {t_new:.3f}"
+                     f"{' | T AT ITS BOUND' if at_bound else ''}")
+    g = torch.Generator().manual_seed(0)
+    z0 = torch.randn(20000, generator=g) * 2.0
+    yy = torch.bernoulli(torch.sigmoid(z0), generator=g)
+    for scale in (0.3, 10.0):
+        tr = MatureTemperatureTracker()
+        tr.collect(scale * z0, yy)
+        t = tr.refit()
+        hit = min(abs(t - tr.t_min), abs(t - tr.t_max)) < 1e-6
+        rep.add("WARN" if hit else "PASS", f"logits x{scale:g} (true T={1 / scale:.2f}): fitted T={t:.3f}"
+                                           f"{' (clamped: calibration cannot fully correct this)' if hit else ''}")
+
+    # 2b: does a small / large T kill the gradient of the PU term?
+    z_sep = make_logits(pnu, "separated")
+
+    def u_grad(scale: float, T: float):
+        z = (z_sep * scale).clone().requires_grad_(True)
+        PU(prior, mode=args.mode)(z / T, y, pnu, age_days=age, in_train_view=view).backward()
+        return z.grad.detach()
+
+    g0 = u_grad(1.0, 1.0)
+    base_norm = max(float(g0.norm()), 1e-30)
+    base_u = max(float(g0[pnu == U].abs().mean()), 1e-30)
+    print(f"  (baseline |g|={float(g0.norm()):.3e} at logit scale 1, T=1; 0 means the PU gradient is clamped to zero)")
+    for scale in (1.0, 2.5):
+        for T in (0.25, 1.0, 4.0):
+            gg = u_grad(scale, T)
+            sat = float((gg[pnu == U].abs() < 1e-3 * base_u).float().mean())
+            tag = "WARN" if sat > 0.5 else "PASS"
+            rep.add(tag, f"logit scale {scale:g}, T={T:g}: |g|/|g_base|={float(gg.norm()) / base_norm:.2f} "
+                         f"U rows with grad < 1e-3 x baseline={sat:.0%}{' | vanishing (heuristic > 50%)' if sat > 0.5 else ''}")
+
+    # 2c: when does the unlabeled prior degenerate?
+    pi, n_young = 0.035, 100_000
+    for p_young in (1000, 2000, 3000, 3500, 4000):
+        n_u = n_young - p_young
+        raw = (pi * n_young - p_young) / n_u
+        used = unlabeled_prior(pi, p_young, n_u)
+        rep.add("WARN" if raw <= 1e-4 else "PASS",
+                f"pi={pi} n_young={n_young} observed P in young={p_young}: raw pi_U={raw:.4f} -> used {used:.4f}"
+                f"{' (CLIPPED: nnPU degenerates to U = negative)' if raw <= 1e-4 else ''}")
+
+    # 2d: REAL priors from the train graph
+    if not args.processed_dir:
+        rep.add("SKIP", "real priors: pass --processed_dir data/processed/<delay>")
+        return
+    from src.data.dataset import load_phase_graph, read_meta
+    from src.train.trainer import TrainConfig, build_training_loss
+    pdir = Path(args.processed_dir)
+    meta = read_meta(pdir)
+    ds = SimpleNamespace(data=load_phase_graph(pdir / "train.pt", validate=False))
+    for mode in ("mature_mean", "sliding_window", "sliding_unlabeled"):
+        cfg = TrainConfig(loss="tw_nndf", loss_params={"mode": "nnpu", "unlabeled_statuses": ["U"], "prior_mode": mode})
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _, info = build_training_loss(cfg, ds, meta)
+        pr = float(info["prior"])
+        true_u = info.get("diag_true_fraud_rate_in_U")  # diagnostic only (reads y_true)
+        extreme = pr < 1e-3 or pr > 0.1 or bool(caught)
+        rep.add("WARN" if extreme else "PASS",
+                f"{mode:<18} prior={pr:.4f} true rate in U (diag)={_f(true_u):.4f} "
+                f"raw_pi_U={_f(info.get('prior_unlabeled_raw')):.4f} warnings={len(caught)}")
+
+
+# --------------------------------------------------------------------------- #
+# PART 3: model selection, pos_weight
+# --------------------------------------------------------------------------- #
+def part3(rep: Report, args) -> None:
+    print("PART 3: model selection and class weighting")
+    for path in (args.base, args.hybrid):
+        p = Path(path)
+        if not p.exists():
+            rep.add("SKIP", f"{path} not found")
+            continue
+        monitor = yaml.safe_load(p.read_text(encoding="utf-8"))["train"].get("monitor")
+        rep.add("PASS" if monitor == "pr_auc" else "WARN", f"{path}: train.monitor = {monitor} (best epoch is picked on validation {monitor})")
+
+    hits = [str(f.relative_to(REPO_ROOT)) for f in list((REPO_ROOT / "src" / "losses").glob("*.py"))
+            + [REPO_ROOT / "src" / "train" / "trainer.py"] if f.exists() and "pos_weight" in f.read_text(encoding="utf-8")]
+    rep.add("FAIL" if hits else "PASS", "pos_weight used in: " + (", ".join(hits) if hits else "no loss / trainer (same footing for all methods)"))
+
+    from src.train.utils import EarlyStopper
+    curve = [0.35, 0.31, 0.29, 0.28, 0.28, 0.27, 0.27]       # shape seen at V1 (illustrative, not data)
+    st = EarlyStopper(args.patience, 0.0, start_epoch=args.warmup + 1)
+    stopped = None
+    for e, v in enumerate(curve, 1):
+        st.update(v, e)
+        if st.should_stop:
+            stopped = e
+            break
+    rep.add("WARN" if st.best_epoch <= args.warmup + 1 else "PASS",
+            f"illustrative decreasing curve: best_epoch={st.best_epoch}, stops at epoch {stopped} -> the restored model is "
+            f"the epoch-{st.best_epoch} model (warmup={args.warmup}, patience={args.patience})")
+
+    if not args.runs_dir:
+        rep.add("SKIP", "run JSONs: pass --runs_dir results/runs")
+        return
+    files = sorted(glob.glob(str(Path(args.runs_dir) / "*.json")))
+    if not files:
+        rep.add("SKIP", f"no JSON in {args.runs_dir}")
+    for f in files:
+        d = json.loads(Path(f).read_text(encoding="utf-8"))
+        fit = d.get("fit") or {}
+        hist = fit.get("history") or []
+        if not hist:
+            continue
+        best = int(fit["best_epoch"])
+        row = next((h for h in hist if int(h["epoch"]) == best), {})
+        rep.add("WARN" if best <= args.warmup + 1 else "PASS",
+                f"{Path(f).stem}: best_epoch={best}/{fit.get('epochs_run')} "
+                f"val_pr_auc best={_f(row.get('val_pr_auc')):.4f} last={_f(hist[-1].get('val_pr_auc')):.4f}")
+
+
+# --------------------------------------------------------------------------- #
+# PART 4: causality on val / test (real graphs, needs pyg-lib)
+# --------------------------------------------------------------------------- #
+def part4(rep: Report, args) -> None:
+    print("PART 4: causal sampling and label invariance on validation / test")
+    if not args.processed_dir:
+        rep.add("SKIP", "pass --processed_dir data/processed/<delay>")
+        return
+    import numpy as np
+    from src.data.dataset import load_phase_datasets, load_phase_graph, read_meta
+    from src.graph.builder import TXN
+    from src.graph.sampler import CausalityError, build_neighbor_loader, has_pyg_lib, verify_batch_causality
+    from src.losses.canary import model_leakage_hook
+    from src.models.classifier import FraudClassifier, entity_vocab_sizes_from_meta
+    if not has_pyg_lib():
+        rep.add("SKIP", "pyg-lib missing: temporal sampling impossible (the code refuses to fall back)")
+        return
+    pdir = Path(args.processed_dir)
+    cfg = yaml.safe_load(Path(args.base).read_text(encoding="utf-8"))
+    dsets = load_phase_datasets(pdir, dict(cfg["sampler"]), phases=("val", "test"))
+
+    for phase, ds in dsets.items():                        # 4a: no node / edge later than its seed
+        try:
+            n = 0
+            for batch in ds:
+                verify_batch_causality(batch, strict_time=ds.strict_time)
+                n += 1
+                if n >= args.n_batches:
+                    break
+            rep.add("PASS", f"{phase}: {n} batches, no node / edge later than its seed (strict_time={ds.strict_time})")
+        except CausalityError as exc:
+            rep.add("FAIL", f"{phase}: {exc}")
+
+    va = load_phase_graph(pdir / "val.pt", validate=False)  # 4b: delete-the-future, val.pt vs test.pt
+    te = load_phase_graph(pdir / "test.pt", validate=False)
+    rng = np.random.default_rng(0)
+    cand = torch.nonzero(va[TXN].seed_mask).view(-1)[-5000:]
+    seeds = cand[torch.from_numpy(rng.choice(len(cand), 50, replace=False))].sort().values
+
+    def history(data):
+        m = torch.zeros(data[TXN].num_nodes, dtype=torch.bool)
+        m[seeds] = True
+        loader = build_neighbor_loader(data, [15, 10], batch_size=len(seeds), seed_mask=m, temporal_strategy="last")
+        b = next(iter(loader))
+        verify_batch_causality(b)
+        st, bs = b[TXN], int(b[TXN].batch_size)
+        return st.tid[:bs], [sorted(st.tid[st.batch == i].tolist()) for i in range(bs)]
+
+    s_va, h_va = history(va)
+    s_te, h_te = history(te)
+    same = torch.equal(s_va, s_te) and h_va == h_te
+    rep.add("PASS" if same else "FAIL", "history of val seeds is identical when the TEST rows are added to the graph"
+                                         if same else "history of a val seed CHANGED when later rows were added: the future leaks")
+
+    ds = dsets["val"]                                      # 4c: logits do not depend on label fields
+    meta = read_meta(pdir)
+    model = FraudClassifier.from_config(dict(cfg["model"]), in_dim=ds.model_in_dim,
+                                        entity_vocab_sizes=entity_vocab_sizes_from_meta(meta),
+                                        conv_type=str(cfg["model"].get("backbone", "sage")))
+    try:
+        model_leakage_hook(model, next(iter(ds)))
+        rep.add("PASS", "model output is invariant to y_obs / y_true / pnu of a real validation batch")
+    except AssertionError as exc:
+        rep.add("FAIL", f"label leaks into the forward pass: {exc}")
+
+
+# --------------------------------------------------------------------------- #
+# PART 5: configs
+# --------------------------------------------------------------------------- #
+EXPECT_COMMON = {
+    ("train", "lr"): 0.001, ("train", "weight_decay"): 1e-5, ("train", "epochs"): 30, ("train", "patience"): 5,
+    ("train", "warmup_epochs"): 1, ("train", "monitor"): "pr_auc", ("train", "grad_clip"): 1.0,
+    ("sampler", "batch_size"): 1024, ("sampler", "strict_time"): True, ("sampler", "temporal_strategy"): "uniform",
+    ("eval", "fpr"): 0.01, ("eval", "review_cost"): 0.0, ("model", "use_temporal"): True, ("model", "hidden_dim"): 128,
+}
+EXPECT_HYBRID = {
+    ("loss", "tw_nndf", "variant"): "hybrid", ("loss", "tw_nndf", "mode"): "nnpu", ("loss", "tw_nndf", "lambda_pu"): 0.3,
+    ("loss", "tw_nndf", "amount_weighted"): True, ("loss", "tw_nndf", "max_weight"): 10.0,
+    ("loss", "tw_nndf", "amount_aware"): True, ("loss", "tw_nndf", "amount_min_age_days"): None,
+    ("loss", "tw_nndf", "calibration", "enabled"): True,
+}
+INFO_KEYS = [("loss", "tw_nndf", "prior_mode"), ("loss", "tw_nndf", "beta"), ("loss", "tw_nndf", "gamma"),
+             ("loss", "maturity_mask", "amount_aware"), ("loss", "delay_ipw", "lam")]
+
+
+def dig(d, path):
+    for k in path:
+        if not isinstance(d, dict) or k not in d:
+            return MISSING
+        d = d[k]
+    return d
+
+
+def part5(rep: Report, args) -> None:
+    print("PART 5: configs (leftovers of debug / smoke runs)")
+    cfgs = {}
+    for name, path in (("base", args.base), ("hybrid", args.hybrid)):
+        p = Path(path)
+        if p.exists():
+            cfgs[name] = yaml.safe_load(p.read_text(encoding="utf-8"))
+        else:
+            rep.add("SKIP", f"{path} not found")
+    for name, cfg in cfgs.items():
+        expect = dict(EXPECT_COMMON, **(EXPECT_HYBRID if name == "hybrid" else {}))
+        bad = []
+        for path, want in expect.items():
+            got = dig(cfg, path)
+            if got is MISSING or got != want:
+                bad.append(f"{'.'.join(path)}={'<missing>' if got is MISSING else got!r} (expected {want!r})")
+        rep.add("WARN" if bad else "PASS", f"{name}: " + ("; ".join(bad) if bad else f"{len(expect)} keys at their full-run values"))
+        info = ", ".join(f"{'.'.join(k[1:])}={'-' if dig(cfg, k) is MISSING else dig(cfg, k)}" for k in INFO_KEYS)
+        print(f"         {name} (info): {info}")
+    if len(cfgs) == 2:
+        diff = sorted(k for k in set(cfgs["base"]) | set(cfgs["hybrid"])
+                      if k != "loss" and cfgs["base"].get(k) != cfgs["hybrid"].get(k))
+        rep.add("WARN" if diff else "PASS", "base vs hybrid differ outside `loss` in: " + ", ".join(diff) if diff
+                else "base and hybrid differ only in the `loss` block")
+
+    bpath = Path(args.benchmark)
+    if not bpath.exists():
+        rep.add("SKIP", f"{args.benchmark} not found")
+        return
+    bench = yaml.safe_load(bpath.read_text(encoding="utf-8"))["benchmark"]
+    spec = importlib.util.spec_from_file_location("rb_preflight", REPO_ROOT / "scripts" / "run_benchmark.py")
+    rb = importlib.util.module_from_spec(spec)
+    sys.modules["rb_preflight"] = rb                        # dataclasses need the module registered
+    spec.loader.exec_module(rb)
+    plan = rb.build_plan(bench)
+    main_runs = [s for s in plan if not s.oracle]
+    first_ok = all(not s.oracle for s in plan[:len(main_runs)])
+    rep.add("PASS" if (len(plan), len(main_runs)) == (90, 72) and first_ok else "FAIL",
+            f"plan = {len(plan)} runs ({len(main_runs)} method + {len(plan) - len(main_runs)} oracle); "
+            f"method runs first: {first_ok}")
+    rep.add("PASS" if sorted(bench["seeds"]) == [42, 43, 44] else "WARN", f"seeds = {bench['seeds']}")
+    mh = bench.get("max_hours")
+    rep.add("WARN" if (mh is not None and mh > 12) else "PASS",
+            f"benchmark.max_hours = {mh} (per invocation; pass --max_hours <session cap> on the CLI)")
+    for name in bench["delays"]:
+        dpath = REPO_ROOT / "configs" / f"{name}.yaml"
+        if not dpath.exists():
+            rep.add("FAIL", f"{dpath.name} missing")
+            continue
+        d = yaml.safe_load(dpath.read_text(encoding="utf-8"))["delay"]
+        s, k, cap = d["params"]["scale_days"], d["params"]["shape"], d["params"]["cap_days"]
+        f_cap = 1.0 - math.exp(-((cap / s) ** k))
+        median = s * (-math.log(1.0 - 0.5 * f_cap)) ** (1.0 / k)
+        lam = (bench.get("lam_by_delay") or {}).get(name)
+        lam_ok = lam is not None and abs(lam - math.log(2.0) / median) <= 0.02 * math.log(2.0) / median
+        w_ok = d["maturity_window_days"] >= cap
+        rep.add("PASS" if lam_ok and w_ok else "FAIL",
+                f"{name}: lam={lam} (ln2/median={math.log(2.0) / median:.4f}) W={d['maturity_window_days']} >= cap={cap}: {w_ok}")
+
+
+# --------------------------------------------------------------------------- #
+PARTS = {"1": part1, "2": part2, "3": part3, "4": part4, "5": part5}
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="Pre-flight checks, one part at a time.")
+    ap.add_argument("--part", nargs="+", default=["all"], choices=["all", *PARTS])
+    ap.add_argument("--processed_dir", default=None, help="e.g. data/processed/delay_high (parts 2 and 4)")
+    ap.add_argument("--runs_dir", default=None, help="folder of run JSONs, e.g. results/runs (part 3)")
+    ap.add_argument("--base", default="configs/base.yaml")
+    ap.add_argument("--hybrid", default="configs/base_hybrid.yaml")
+    ap.add_argument("--benchmark", default="configs/benchmark.yaml")
+    ap.add_argument("--priors", type=float, nargs="+", default=[0.0338, 0.0139],
+                    help="dummy-data priors: 0.0338 = V1 estimate, 0.0139 = true rate in U (delay_high)")
+    ap.add_argument("--mode", choices=["clamp", "nnpu"], default="nnpu")
+    ap.add_argument("--lambda_pu", type=float, default=0.3)
+    ap.add_argument("--max_weight", type=float, default=10.0)
+    ap.add_argument("--n_batches", type=int, default=10)
+    ap.add_argument("--patience", type=int, default=5)
+    ap.add_argument("--warmup", type=int, default=1)
+    args = ap.parse_args(argv)
+
+    rep = Report()
+    for p in (list(PARTS) if "all" in args.part else args.part):
+        try:
+            PARTS[p](rep, args)
+        except Exception as exc:  # noqa: BLE001 - one broken part must not hide the others
+            rep.add("FAIL", f"part {p} crashed: {type(exc).__name__}: {exc}")
+        print()
+    print("SUMMARY: " + " | ".join(f"{k}={v}" for k, v in rep.count.items()))
+    return 1 if rep.count["FAIL"] else 0
 
 
 if __name__ == "__main__":
@@ -5124,10 +5928,6 @@ FILE: scripts\run_benchmark.py
 
 ================================================================================
 
-# =====================================================================
-# FILE: scripts/run_benchmark.py
-# TRẠNG THÁI: ĐÃ SỬA (xóa định nghĩa lặp apply_prior_override; logic giữ nguyên)
-# =====================================================================
 #!/usr/bin/env python
 """Benchmark runner with auto-resume.
 
@@ -5178,12 +5978,14 @@ LOSSES = ("naive_bce", "maturity_mask", "delay_ipw", "tw_nndf")
 HASHED_SECTIONS = ("sampler", "model", "train", "eval", "loss", "features")
 
 RESULT_COLUMNS: list[str] = [
-    "run_id", "status", "group", "delay", "loss", "oracle", "backbone", "use_temporal", "lp_features", "seed",
+    "run_id", "status", "group", "delay", "loss", "variant", "oracle",
+    "backbone", "use_temporal", "lp_features", "seed",
     "prior_override", "in_dim", "n_params", "best_epoch", "epochs_run",
     "val_pr_auc", "val_roc_auc", "test_pr_auc", "test_roc_auc", "test_recall_at_fpr",
     "test_recall_at_valthr", "test_fpr_at_valthr", "test_efl", "test_efl_ratio",
     "lam", "nndf_prior", "nndf_prior_estimated", "diag_true_fraud_rate_in_U",
-    "nndf_clamped_best", "nndf_clamped_mean", "nndf_neg_risk_raw_best", "nndf_pos_risk_best", "n_empty_batches_total",
+    "nndf_clamped_best", "nndf_clamped_mean", "nndf_neg_risk_raw_best", "nndf_pos_risk_best", 
+    "nndf_prior_used_mean", "nndf_u_kept_frac_mean", "nndf_pu_loss_mean", "n_empty_batches_total",
     "train_seconds", "wall_seconds", "peak_vram_alloc_mb", "prereg_status", "cfg_hash", "meta_sha",
     "finished_utc", "error",
 ]
@@ -5205,10 +6007,13 @@ class RunSpec:
     lp: bool
     seed: int
     prior: float | None = None
+    variant: str | None = None
 
     @property
     def label(self) -> str:
-        return "oracle" if self.oracle else self.loss
+        if self.oracle:
+            return "oracle"
+        return self.loss if self.variant is None else f"{self.loss}_{self.variant}"
 
     @property
     def run_id(self) -> str:
@@ -5217,7 +6022,7 @@ class RunSpec:
 
 
 def build_plan(bench: Mapping[str, Any]) -> list[RunSpec]:
-    """Expand the benchmark spec into an ordered list of runs; duplicate run_ids are an error."""
+    """Expand groups, delays, losses, variants and seeds; reject duplicate run IDs."""
     seeds = [int(s) for s in bench["seeds"]]
     default_delays = list(bench["delays"])
     default_backbone = str(bench.get("backbone", "sage"))
@@ -5231,6 +6036,20 @@ def build_plan(bench: Mapping[str, Any]) -> list[RunSpec]:
         bad = [x for x in losses if x not in LOSSES]
         if bad:
             raise ValueError(f"group '{gname}': unknown loss {bad}; allowed {LOSSES}")
+        variant_map = g.get("variants") or {}
+        variants: list[str | None] = (
+            list(variant_map.keys()) if variant_map else [None]
+        )
+        if variant_map and (oracle or losses != ["tw_nndf"]):
+            raise ValueError(
+                f"group '{gname}': variants only make sense for "
+                "non-oracle losses == ['tw_nndf']"
+            )
+        if variant_map:
+            for vname, override in variant_map.items():
+                if not isinstance(override, Mapping):
+                    raise ValueError(f"group '{gname}': variant '{vname}' must be a mapping.")
+                    
         prior_map = g.get("priors_by_delay")
         for delay in g.get("delays", default_delays):
             priors: list[float | None] = [None] if prior_map is None else list(prior_map.get(delay, []))
@@ -5238,15 +6057,17 @@ def build_plan(bench: Mapping[str, Any]) -> list[RunSpec]:
                 for prior in priors:
                     if prior is not None and (loss != "tw_nndf" or oracle):
                         raise ValueError(f"group '{gname}': priors_by_delay only makes sense for tw_nndf")
-                    for seed in seeds:
-                        spec = RunSpec(group=gname, delay=delay, loss=loss, oracle=oracle,
-                                       backbone=str(g.get("backbone", default_backbone)),
-                                       use_temporal=bool(g.get("use_temporal", True)), lp=bool(g.get("lp", False)),
-                                       seed=seed, prior=None if prior is None else float(prior))
-                        if spec.run_id in seen:
-                            raise ValueError(f"duplicate run_id {spec.run_id} (group '{gname}')")
-                        seen.add(spec.run_id)
-                        plan.append(spec)
+                    
+                    for var in variants:
+                        for seed in seeds:
+                            spec = RunSpec(group=gname, delay=delay, loss=loss, oracle=oracle,
+                                           backbone=str(g.get("backbone", default_backbone)),
+                                           use_temporal=bool(g.get("use_temporal", True)), lp=bool(g.get("lp", False)),
+                                           seed=seed, prior=None if prior is None else float(prior), variant=var)
+                            if spec.run_id in seen:
+                                raise ValueError(f"duplicate run_id {spec.run_id} (group '{gname}')")
+                            seen.add(spec.run_id)
+                            plan.append(spec)
     return plan
 
 
@@ -5264,6 +6085,22 @@ def resolve_cfg(base_cfg: Mapping[str, Any], bench: Mapping[str, Any], spec: Run
         if lam is not None:
             d["lam"] = float(lam)
         loss_cfg["delay_ipw"] = d
+        
+    if spec.variant is not None:
+        try:
+            override = bench["groups"][spec.group]["variants"][spec.variant]
+        except KeyError as exc:
+            raise KeyError(
+                f"Cannot resolve variant '{spec.variant}' "
+                f"for group '{spec.group}'."
+            ) from exc
+        if spec.loss != "tw_nndf" or spec.oracle:
+            raise ValueError("Variants are supported only for non-oracle tw_nndf.")
+        loss_cfg = cfg.setdefault("loss", {})
+        tw_cfg = dict(loss_cfg.get("tw_nndf") or {})
+        tw_cfg.update(dict(override))
+        loss_cfg["tw_nndf"] = tw_cfg
+        
     return cfg
 
 
@@ -5285,8 +6122,12 @@ def apply_prior_override(plan: Sequence[RunSpec], prior: float) -> list[RunSpec]
 
 def hash_config(base_cfg: Mapping[str, Any], bench: Mapping[str, Any]) -> str:
     payload = {k: base_cfg.get(k) for k in HASHED_SECTIONS}
-    payload["lam_by_delay"] = bench.get("lam_by_delay")
-    payload["backbone"] = bench.get("backbone")
+    # Execution budget is not part of the scientific protocol.
+    protocol = {
+        k: v for k, v in bench.items()
+        if k not in ("max_hours",)
+    }
+    payload["benchmark_protocol"] = protocol
     return hashlib.sha256(json.dumps(jsonable(payload), sort_keys=True).encode()).hexdigest()[:12]
 
 
@@ -5346,6 +6187,7 @@ def _now_utc() -> str:
 def finalize_row(spec: RunSpec, res: Mapping[str, Any], *, wall: float, cfg_hash: str, meta_sha: str) -> dict[str, Any]:
     """run_one() row + benchmark fields + tw_nndf diagnostics at the best epoch (the model that is evaluated)."""
     row = dict(res["row"])
+    row["variant"] = spec.variant
     det = res["details"]
     info, hist = det.get("info", {}), det.get("fit", {}).get("history", [])
     row.update(run_id=spec.run_id, status="ok", group=spec.group, prior_override=spec.prior, wall_seconds=wall,
@@ -5359,13 +6201,22 @@ def finalize_row(spec: RunSpec, res: Mapping[str, Any], *, wall: float, cfg_hash
         row["nndf_pos_risk_best"] = h.get("nndf_pos_risk")
         row["nndf_clamped_mean"] = sum(float(x["nndf_clamped_rate"]) for x in hist) / len(hist)
         row["n_empty_batches_total"] = sum(float(x.get("n_empty_batches", 0.0)) for x in hist)
+        row["nndf_prior_used_mean"] = (
+            sum(float(x.get("nndf_prior_used", 0.0)) for x in hist) / len(hist)
+        )
+        row["nndf_u_kept_frac_mean"] = (
+            sum(float(x.get("nndf_u_kept_frac", 0.0)) for x in hist) / len(hist)
+        )
+        row["nndf_pu_loss_mean"] = (
+            sum(float(x.get("nndf_pu_loss", 0.0)) for x in hist) / len(hist)
+        )
     return row
 
 
 def failed_row(spec: RunSpec, exc: BaseException, *, wall: float, cfg_hash: str) -> dict[str, Any]:
     msg = f"{type(exc).__name__}: {exc}".replace("\n", " ")[:300]
     return {"run_id": spec.run_id, "status": "failed", "group": spec.group, "delay": spec.delay, "loss": spec.label,
-            "oracle": spec.oracle, "backbone": spec.backbone, "use_temporal": spec.use_temporal,
+            "variant": spec.variant, "oracle": spec.oracle, "backbone": spec.backbone, "use_temporal": spec.use_temporal,
             "lp_features": spec.lp, "seed": spec.seed, "prior_override": spec.prior, "wall_seconds": wall,
             "prereg_status": PREREG_STATUS, "cfg_hash": cfg_hash, "finished_utc": _now_utc(), "error": msg}
 
@@ -5687,7 +6538,8 @@ FILE: configs\base.yaml
 
 # configs/base.yaml -- shared settings. Overlay a delay file on top of it:
 #   python scripts/prepare_data.py --config configs/base.yaml --delay_config configs/delay_low.yaml
-# Keys marked "round 5" are placeholders for the model/trainer and are not read yet.
+# V2: the `loss:` block is IDENTICAL to configs/base_nnpu.yaml (hybrid TW-nnDF, sliding_unlabeled prior,
+# calibration with T >= 0.5). tests/test_config_nnpu.py checks that the two files differ nowhere else.
 
 seed: 42
 seeds: [42, 43, 44]            # 3 seeds -> 95% CI against the naive baseline A0
@@ -5716,12 +6568,8 @@ features:
 graph:
   # ASSUMPTION: IEEE-CIS has no true card/device id. Each entity is a PROXY key built
   # from several columns (card1..card6; DeviceInfo+id_30+id_31).
-  # A row gets an edge only if every column in required_cols is non-null.
-  # max_degree = super-node cap, FITTED ON THE TRAIN PERIOD ONLY: an entity with more
-  # than max_degree train transactions is removed everywhere (its edges are dropped).
-  # EMAIL IS NO LONGER AN ENTITY: a purchaser-email domain is a low-cardinality attribute
-  # (a few dozen values), so every domain exceeded max_degree and 98.2% of train edges were
-  # removed. It is now a feature block of the transaction node (see features.email).
+  # max_degree = super-node cap, FITTED ON THE TRAIN PERIOD ONLY.
+  # The email domain is a transaction-feature block (features.email), not an entity.
   entities:
     card:
       key_cols: [card1, card2, card3, card4, card5, card6]
@@ -5732,62 +6580,73 @@ graph:
       required_cols: [DeviceInfo]
       max_degree: 2000
   features:
-    # Transaction-node features: numeric columns (V*, C*, D*, TransactionAmt, id_01..)
-    # except numeric_exclude, median-imputed and z-scored with TRAIN statistics, plus
-    # one-hot of the low-cardinality columns in onehot_cols (top max_categories on train).
     onehot_cols: [ProductCD, card4, card6, M1, M2, M3, M4, M5, M6, M7, M8, M9]
     numeric_exclude: [card1, addr1, addr2]   # id-like codes: not meaningful as numbers
     max_categories: 30
-    # NEW: numeric columns whose TRAIN missing ratio is > max_missing_ratio are dropped
-    # before imputation / scaling. null disables the filter. 0.9 is a starting value,
-    # not a tuned one: the encoder prints which columns were dropped.
-    max_missing_ratio: 0.9
+    max_missing_ratio: 0.9       # TRAIN-only column filter; null disables
     clip_z: 10.0
     add_missing_ratio: true
-    # NEW: email as transaction features (statistics fitted on TRAIN only).
     email:
-      cols: [P_emaildomain]      # add R_emaildomain here if you want the recipient too
-      top_k: 10                  # one-hot of the 10 most frequent TRAIN domains (+ other, + missing)
-      add_frequency: true        # relative frequency of the domain in TRAIN (unseen -> 0.0)
+      cols: [P_emaildomain]
+      top_k: 10
+      add_frequency: true
 
 sampler:
-  num_neighbors: [15, 10]      # per hop. NOTE: a transaction has <= 1 neighbour per entity
-                               # type in hop 1, so the effective fan-out is ~[1, 10].
+  num_neighbors: [15, 10]      # per hop (effective fan-out ~[1, 10]: <= 1 neighbour per entity type in hop 1)
   batch_size: 1024
   eval_batch_size: 2048
-  temporal_strategy: uniform   # uniform | last (most recent neighbours first)
+  temporal_strategy: uniform   # uniform | last
   strict_time: true            # neighbours must be STRICTLY earlier than the seed
   num_workers: 0               # >0 only after checking pyg-lib + fork on your machine
 
 model:
-  backbone: sage         # sage (main, 72 runs) | gat (secondary check only)
+  backbone: sage         # sage (main) | gat (secondary check)
   hidden_dim: 128
   num_layers: 2
   dropout: 0.2
   entity_embedding_dim: 32
   gat_heads: 4           # GAT only; hidden_dim must be divisible by it
-  max_history: 20        # most recent history transactions fed to the GRU per seed
+  max_history: 20
   gru_layers: 1
-  use_temporal: true     # false -> SAGEConv/GATConv + MLP ablation
+  use_temporal: false    # V2 SSOT: no GRU / temporal recurrent module
 
 train:
   lr: 0.001
   weight_decay: 0.00001
   epochs: 30
   patience: 5
-  warmup_epochs: 1       # linear LR warm-up per step; early-stopping patience starts after it
+  warmup_epochs: 1
   min_delta: 0.0
-  monitor: pr_auc        # pr_auc | roc_auc | recall_at_fpr (VALIDATION)
+  monitor: pr_auc        # VALIDATION
   grad_clip: 1.0         # null disables
 
 eval:
-  fpr: 0.01              # operating point: threshold chosen on VAL so that FPR <= 1%
+  fpr: 0.01
   review_cost: 0.0       # EFL = missed fraud amount + review_cost * #FP. 0 = no explicit FP cost (KHÔNG CHẮC)
 
 loss:
   name: naive_bce        # naive_bce | maturity_mask | delay_ipw | tw_nndf
-  delay_ipw: {lam: 0.23} # ln2 / median_delay_days, to be swept (KHÔNG CHẮC if it is the right scale)
-  tw_nndf: {unlabeled_statuses: [U], mode: nnpu, beta: 0.0, gamma: 1.0}
+  delay_ipw: {lam: 0.23} # overridden per delay by benchmark.lam_by_delay
+  maturity_mask:
+    amount_aware: false          # C12 locked: main matrix = plain Maturity-Masked BCE (true only in the ablation)
+    amount_quantile: 0.95
+    amount_min_age_days: null    # null -> W/2
+  tw_nndf:
+    variant: hybrid              # Maturity-Masked BCE + Cost-Sensitive nnPU (pu_only = ablation)
+    unlabeled_statuses: [U]
+    mode: nnpu
+    beta: 0.0
+    gamma: 1.0
+    lambda_pu: 0.3               # locked V1.5 (design choice, KHÔNG CHẮC)
+    prior_mode: sliding_unlabeled  # mature_mean | sliding_window | sliding_unlabeled | sliding_dynamic
+    prior_span_days: 14
+    prior_n_windows: 3
+    amount_weighted: true        # cost-sensitive nnPU (TransactionAmt)
+    max_weight: 10.0
+    amount_aware: true           # trusted U rows: amount >= p95(TRAIN) and age >= amount_min_age_days
+    amount_quantile: 0.95
+    amount_min_age_days: null    # null -> W/2
+    calibration: {enabled: true, max_samples: 200000, t_min: 0.5, t_max: 4.0}   # t_min 0.25 -> 0.5 (U gradient)
 
 ================================================================================
 
@@ -5795,21 +6654,21 @@ FILE: configs\base_nnpu.yaml
 
 ================================================================================
 
-# configs/base_nnpu.yaml -- V1.5 config: IDENTICAL to base.yaml except the `loss:` block (hybrid TW-nnDF).
+# configs/base_nnpu.yaml -- V2 config: IDENTICAL to base.yaml (kept as an explicit copy for the nnpu runs).
 # Keep it a COMPLETE file: run_one / profile_epoch / smoke_forward read cfg["sampler"], cfg["model"], cfg["train"]
 # directly, and the benchmark config hash covers sampler/model/train/eval/loss/features.
-# tests/test_config_nnpu.py checks that it differs from base.yaml only in `loss`.
+# tests/test_config_nnpu.py checks that it differs from base.yaml only in `loss` (currently: not at all).
 
 seed: 42
 seeds: [42, 43, 44]            # 3 seeds -> 95% CI against the naive baseline A0
 
 paths:
-  data_dir: data               # folder with train_transaction.csv / train_identity.csv
+  data_dir: data
   processed_dir: data/processed
   results_dir: results
   checkpoints_dir: checkpoints
 
-split:                         # temporal split over the time span, day-aligned
+split:
   train_ratio: 0.65
   val_ratio: 0.16
   test_ratio: 0.19
@@ -5862,7 +6721,7 @@ model:
   gat_heads: 4
   max_history: 20
   gru_layers: 1
-  use_temporal: true
+  use_temporal: false
 
 train:
   lr: 0.001
@@ -5882,17 +6741,17 @@ loss:
   name: naive_bce        # naive_bce | maturity_mask | delay_ipw | tw_nndf
   delay_ipw: {lam: 0.23} # overridden per delay by benchmark.lam_by_delay
   maturity_mask:
-    amount_aware: true           # C12 locked: same masking as tw_nndf (p95 of TRAIN amounts, age >= W/2)
+    amount_aware: false          # C12 locked: main matrix = plain Maturity-Masked BCE (true only in the ablation)
     amount_quantile: 0.95
     amount_min_age_days: null    # null -> W/2
   tw_nndf:
-    variant: hybrid              # Maturity-Masked BCE + Cost-Sensitive nnPU
+    variant: hybrid              # Maturity-Masked BCE + Cost-Sensitive nnPU (pu_only = ablation)
     unlabeled_statuses: [U]
     mode: nnpu
     beta: 0.0
     gamma: 1.0
     lambda_pu: 0.3               # locked V1.5 (design choice, KHÔNG CHẮC)
-    prior_mode: sliding_window   # mature_mean | sliding_window | sliding_unlabeled
+    prior_mode: sliding_unlabeled  # mature_mean | sliding_window | sliding_unlabeled | sliding_dynamic
     prior_span_days: 14
     prior_n_windows: 3
     amount_weighted: true        # cost-sensitive nnPU (TransactionAmt)
@@ -5900,7 +6759,7 @@ loss:
     amount_aware: true           # trusted U rows: amount >= p95(TRAIN) and age >= amount_min_age_days
     amount_quantile: 0.95
     amount_min_age_days: null    # null -> W/2
-    calibration: {enabled: true, max_samples: 200000, t_min: 0.25, t_max: 4.0}
+    calibration: {enabled: true, max_samples: 200000, t_min: 0.5, t_max: 4.0}   # t_min 0.25 -> 0.5 (U gradient)
 
 ================================================================================
 
@@ -5910,42 +6769,45 @@ FILE: configs\benchmark.yaml
 
 benchmark:
   seeds: [42, 43, 44]
-  # delay_very_high needs: python scripts/prepare_data.py --delay_config configs/delay_very_high.yaml
+  # Each delay name = a folder data/processed/<name>, produced by
+  #   python scripts/prepare_data.py --delay_config configs/<name>.yaml
   delays: [delay_low, delay_high, delay_very_high]
   backbone: sage
   # Kaggle quota guard: the runner stops cleanly before this many hours (CLI --max_hours overrides it).
   # Group order below = priority: the 72 method runs first, the 18 oracle runs last.
   max_hours: 28.0
   lam_by_delay:                 # ln2 / median of the truncated Weibull at the reference amount
-    delay_low: 0.324            # median ~2.14 d
-    delay_high: 0.080           # median ~8.68 d
-    delay_very_high: 0.0399     # median ~17.36 d (scale 24, shape 1.3, cap 60)
+    delay_low: 0.324            # median ~2.14 d  (scale 3,  shape 1.3, cap 7)
+    delay_high: 0.080           # median ~8.68 d (scale 12, shape 1.3, cap 30)
+    delay_very_high: 0.040      # median ~17.27 d (scale 27, shape 1.3, cap 45)
   groups:
     main_sage:                  # 4 methods x 3 delays x 3 seeds = 36 runs (naive_bce = A0)
       enabled: true
       backbone: sage
       losses: [naive_bce, maturity_mask, delay_ipw, tw_nndf]
       lp: false
-      use_temporal: true
-    main_gat:                   # secondary backbone, 36 runs  -> the 72 method runs end here
+      use_temporal: false
+    main_gat:                   # secondary backbone, 36 runs -> the 72 method runs end here
       enabled: true
       backbone: gat
       losses: [naive_bce, maturity_mask, delay_ipw, tw_nndf]
       lp: false
-      use_temporal: true
-    oracle_sage:                # NaiveBCE on y_true (Recovery Ratio), 9 runs, run AFTER the 72
+      use_temporal: false
+    oracle_sage:                # NaiveBCE on y_true (Recovery Ratio), 9 runs, run AFTER the methods
       enabled: true
       backbone: sage
       oracle: true
+      use_temporal: false
     oracle_gat:                 # 9 runs
       enabled: true
       backbone: gat
       oracle: true
+      use_temporal: false
     lp_naive:
       enabled: false
       losses: [naive_bce]
       lp: true
-      use_temporal: true
+      use_temporal: false
     ablation_nogru:
       enabled: false
       losses: [naive_bce, tw_nndf]
@@ -5955,7 +6817,7 @@ benchmark:
       enabled: false
       losses: [tw_nndf]
       lp: false
-      use_temporal: true
+      use_temporal: false
       delays: [delay_low, delay_high]
       priors_by_delay: {delay_high: [0.0139], delay_low: [0.0182]}
 
@@ -5976,6 +6838,74 @@ benchmark:
       losses: [tw_nndf]
       lp: false
       use_temporal: true
+
+================================================================================
+
+FILE: configs\benchmark_v2_probe.yaml
+
+================================================================================
+
+benchmark:
+  seeds: [42, 43, 44]
+  delays: [delay_high]
+  backbone: sage
+  max_hours: 10.0
+
+  groups:
+    baselines:
+      enabled: true
+      backbone: sage
+      losses: [naive_bce, maturity_mask]
+      lp: false
+      use_temporal: false
+
+    v2_probe:
+      enabled: true
+      backbone: sage
+      losses: [tw_nndf]
+      lp: false
+      use_temporal: false
+
+      # All variants retain the SSOT cost-sensitive amount weighting and amount-aware trusted-U mask.
+      # The variants differ only in the selected V2 ablation dimension(s).
+      variants:
+        v2_light:
+          variant: hybrid
+          mode: nnpu
+          prior_mode: sliding_unlabeled
+          lambda_pu: 0.05
+          amount_weighted: true
+          amount_aware: true
+          amount_quantile: 0.95
+          amount_min_age_days: null
+          bce_pos_weight: 1.0
+          u_conf_filter: false
+
+        v2_imbalance:
+          variant: hybrid
+          mode: nnpu
+          prior_mode: sliding_unlabeled
+          lambda_pu: 0.05
+          amount_weighted: true
+          amount_aware: true
+          amount_quantile: 0.95
+          amount_min_age_days: null
+          bce_pos_weight: 3.0
+          u_conf_filter: false
+
+        v2_conf:
+          variant: hybrid
+          mode: nnpu
+          prior_mode: sliding_unlabeled
+          lambda_pu: 0.05
+          amount_weighted: true
+          amount_aware: true
+          amount_quantile: 0.95
+          amount_min_age_days: null
+          bce_pos_weight: 3.0
+          u_conf_filter: true
+          u_conf_hi: 0.80
+          u_conf_lo: 0.10
 
 ================================================================================
 
@@ -6018,6 +6948,29 @@ delay:
     amount_ref: null           # null -> median TRAIN amount (filled in by prepare_data)
     cap_days: 7                # truncate the law at 7 days (no mass piled at the cap)
     min_delay_hours: 1.0       # delays are strictly positive
+    seed: 42
+
+================================================================================
+
+FILE: configs\delay_very_high.yaml
+
+================================================================================
+
+# configs/delay_very_high.yaml -- VERY LONG label delay (about 1.5 months). Overlay on base.yaml.
+# Simulation assumptions, not estimates from IEEE-CIS.
+# Truncated Weibull (shape 1.3, scale 27, cap 45): median ~17.3 d at the reference amount
+# -> lam_by_delay = ln2 / 17.27 ~ 0.040 (hand calculation; tests/test_v15_preflight_fixes.py re-derives it).
+# W = cap = 45 keeps W >= cap, so N holds no hidden fraud.
+delay:
+  mode: weibull
+  maturity_window_days: 45
+  params:
+    shape: 1.3
+    scale_days: 27.0
+    amount_exponent: 0.3
+    amount_ref: null
+    cap_days: 45
+    min_delay_hours: 1.0
     seed: 42
 
 ================================================================================
@@ -6359,10 +7312,10 @@ FILE: tests\test_config_nnpu.py
 ================================================================================
 
 # =====================================================================
-# FILE: tests/test_config_nnpu.py   (FILE MỚI)
-# TRẠNG THÁI: MỚI. Smoke test cục bộ, không cần dữ liệu thật: chứng minh mode=nnpu trong base.yaml
-#             tới được loss, ascent kích hoạt, và run_benchmark.py không còn định nghĩa lặp.
-#             Chạy: pytest -q tests/test_config_nnpu.py tests/test_tw_nndf_ascent.py
+# FILE: tests/test_config_nnpu.py
+# V1.5: base.yaml and base_nnpu.yaml now carry the SAME hybrid `loss:` block, so the PU-core tests build
+#       TimeWindowNNDFLoss from the PU-core keys only (unlabeled_statuses, mode, beta, gamma) and run on both files.
+#       Run: pytest -q tests/test_config_nnpu.py tests/test_tw_nndf_ascent.py
 # =====================================================================
 from __future__ import annotations
 
@@ -6380,24 +7333,31 @@ from src.train.trainer import TrainConfig  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 P, U = PNU_CODES["P"], PNU_CODES["U"]
+CONFIGS = ["base.yaml", "base_nnpu.yaml"]
+_PU_CORE_KEYS = ("unlabeled_statuses", "mode", "beta", "gamma")   # constructor keys of the PU core
 
 
-def _loss_from_base_yaml() -> TimeWindowNNDFLoss:
-    cfg = yaml.safe_load((ROOT / "configs" / "base.yaml").read_text(encoding="utf-8"))
-    t = TrainConfig.from_cfg(cfg, loss="tw_nndf")
-    params = dict(t.loss_params)
+def _load(name: str) -> dict:
+    return yaml.safe_load((ROOT / "configs" / name).read_text(encoding="utf-8"))
+
+
+def _loss_from_yaml(name: str) -> TimeWindowNNDFLoss:
+    params = {k: v for k, v in TrainConfig.from_cfg(_load(name), loss="tw_nndf").loss_params.items()
+              if k in _PU_CORE_KEYS}
     if "unlabeled_statuses" in params:
         params["unlabeled_statuses"] = tuple(params["unlabeled_statuses"])
     return TimeWindowNNDFLoss(prior=0.0338, **params)
 
 
-def test_base_yaml_mode_reaches_the_loss():
-    fn = _loss_from_base_yaml()
+@pytest.mark.parametrize("name", CONFIGS)
+def test_yaml_mode_reaches_the_loss(name):
+    fn = _loss_from_yaml(name)
     assert fn.mode == "nnpu" and fn.beta == 0.0 and fn.gamma == 1.0
 
 
-def test_ascent_branch_fires_with_config_loss():
-    fn = _loss_from_base_yaml()
+@pytest.mark.parametrize("name", CONFIGS)
+def test_ascent_branch_fires_with_config_loss(name):
+    fn = _loss_from_yaml(name)
     n_p, n_u = 50, 500
     preds = torch.cat([torch.full((n_p,), 4.0), torch.full((n_u,), -4.0)]).requires_grad_(True)
     pnu = torch.cat([torch.full((n_p,), P), torch.full((n_u,), U)]).long()
@@ -6411,9 +7371,9 @@ def test_run_benchmark_has_no_duplicate_definitions():
     src = (ROOT / "scripts" / "run_benchmark.py").read_text(encoding="utf-8")
     assert src.count("def apply_prior_override(") == 1
 
+
 def test_base_nnpu_is_base_plus_loss_overlay():
-    a = yaml.safe_load((ROOT / "configs" / "base.yaml").read_text(encoding="utf-8"))
-    b = yaml.safe_load((ROOT / "configs" / "base_nnpu.yaml").read_text(encoding="utf-8"))
+    a, b = _load("base.yaml"), _load("base_nnpu.yaml")
     a.pop("loss")
     b_loss = b.pop("loss")
     assert a == b, "base_nnpu.yaml drifted from base.yaml outside `loss:`"
@@ -6421,9 +7381,9 @@ def test_base_nnpu_is_base_plus_loss_overlay():
     assert t["variant"] == "hybrid" and t["mode"] == "nnpu" and t["lambda_pu"] == 0.3
 
 
-def test_base_nnpu_reaches_the_trainer_config():
-    cfg = yaml.safe_load((ROOT / "configs" / "base_nnpu.yaml").read_text(encoding="utf-8"))
-    p = TrainConfig.from_cfg(cfg, loss="tw_nndf").loss_params
+@pytest.mark.parametrize("name", CONFIGS)
+def test_yaml_reaches_the_trainer_config(name):
+    p = TrainConfig.from_cfg(_load(name), loss="tw_nndf").loss_params
     assert p["lambda_pu"] == 0.3 and p["calibration"]["enabled"] is True
 
 ================================================================================
@@ -6869,6 +7829,7 @@ FILE: tests\test_losses_canary.py
 """Round-5 tests: loss gradient/output invariants, model label-invariance, forward -> losses smoke.
 
 Self-contained (toy batches); needs torch + torch_geometric, no pyg-lib.
+V1.5: every ``float(loss)`` on a tensor that may require grad now goes through ``.detach()`` (0 warnings).
 """
 from __future__ import annotations
 
@@ -6982,7 +7943,7 @@ def test_tw_nndf_empty_p_or_u_gives_connected_zero():
     preds = torch.randn(8, requires_grad=True)
     only_n = torch.full((8,), N).long()
     loss = fn(preds, torch.zeros(8).long(), only_n)
-    assert float(loss) == 0.0 and fn.last_risks is None
+    assert float(loss.detach()) == 0.0 and fn.last_risks is None
     loss.backward()  # must not raise
 
 
@@ -7021,7 +7982,7 @@ def test_empty_selection_returns_connected_zero(make):
     preds = torch.randn(6, requires_grad=True)
     pnu = torch.full((6,), U).long()
     loss = make()(preds, torch.zeros(6).long(), pnu, in_train_view=torch.zeros(6, dtype=torch.bool))
-    assert float(loss) == 0.0
+    assert float(loss.detach()) == 0.0
     loss.backward()
 
 
@@ -7036,7 +7997,7 @@ def test_all_four_losses_equal_ln2_at_zero_logits():
         TimeWindowNNDFLoss(prior=0.035)(z, y, pnu),  # pi*ln2 + (1-pi)*ln2
     ]
     for v in vals:
-        assert float(v) == pytest.approx(ln2, abs=1e-5)
+        assert float(v.detach()) == pytest.approx(ln2, abs=1e-5)
 
 
 # --------------------------------------------------------------------------- #
@@ -7130,7 +8091,8 @@ def test_forward_then_four_losses_smoke(conv):
         model.zero_grad(set_to_none=True)
         loss = fn(model(batch), st.y_obs[:bs], st.pnu[:bs], age_days=age, in_train_view=st.in_train_view[:bs])
         assert loss.dim() == 0 and bool(torch.isfinite(loss)), name
-        assert 0.1 < float(loss) < 3.0, f"{name}: implausible initial loss {float(loss)}"  # ~ ln 2 at init
+        value = float(loss.detach())
+        assert 0.1 < value < 3.0, f"{name}: implausible initial loss {value}"  # ~ ln 2 at init
         loss.backward()
 
 ================================================================================
@@ -7829,7 +8791,7 @@ def test_validation_and_empty_batch():
     preds = torch.zeros(5, requires_grad=True)
     pnu = torch.full((5,), U).long()                                               # no P row
     loss = TimeWindowNNDFLoss(PI, mode="nnpu")(preds, (pnu == P).long(), pnu, age_days=torch.zeros(5))
-    assert float(loss) == 0.0
+    assert float(loss.detach()) == 0.0
 
 
 def test_tiny_training_loop_stays_finite_in_both_modes(capsys):
@@ -8149,65 +9111,537 @@ def test_tiny_training_loop_with_epoch_refits_is_finite():
 
 ================================================================================
 
+FILE: tests\test_v15_preflight_fixes.py
+
+================================================================================
+
+"""V1.5 preflight fixes: delay_very_high, benchmark matrix (72 + 18), sliding_unlabeled, T >= 0.5, train-only prior epsilon,
+and the C6 check (variant=pu_only logs bce=0.0000 without crashing). CPU only, no real data.
+
+Run the C6 part alone and see the log lines:  pytest -q -s tests/test_v15_preflight_fixes.py -k pu_only
+"""
+from __future__ import annotations
+
+import importlib.util
+import math
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+torch = pytest.importorskip("torch")
+yaml = pytest.importorskip("yaml")
+pytest.importorskip("torch_geometric")
+from torch_geometric.data import HeteroData  # noqa: E402
+
+from src.graph.builder import PNU_CODES, TXN  # noqa: E402
+from src.losses.calibration import (  # noqa: E402
+    PRIOR_EPS, T_MIN_DEFAULT, MatureTemperatureTracker, unlabeled_prior, unlabeled_prior_raw,
+)
+from src.losses.tw_nndf import HybridTWnnDFLoss, TimeWindowNNDFLoss  # noqa: E402
+from src.models.classifier import FraudClassifier  # noqa: E402
+from src.models.temporal_gnn import ModularTemporalGNN  # noqa: E402
+from src.train.trainer import TrainConfig, Trainer  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[1]
+DELAYS = ["delay_low", "delay_high", "delay_very_high"]
+P, N, U = PNU_CODES["P"], PNU_CODES["N"], PNU_CODES["U"]
+
+
+def _yaml(rel: str) -> dict:
+    return yaml.safe_load((ROOT / rel).read_text(encoding="utf-8"))
+
+
+def _load_run_benchmark():
+    spec = importlib.util.spec_from_file_location("run_benchmark_v15", ROOT / "scripts" / "run_benchmark.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["run_benchmark_v15"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _trunc_weibull_median(shape: float, scale: float, cap: float) -> float:
+    """Median of a Weibull truncated (renormalised) to [0, cap], by bisection."""
+    cdf = lambda x: 1.0 - math.exp(-((x / scale) ** shape))  # noqa: E731
+    target = cdf(cap) / 2.0
+    lo, hi = 0.0, cap
+    for _ in range(200):
+        mid = (lo + hi) / 2.0
+        lo, hi = (mid, hi) if cdf(mid) < target else (lo, mid)
+    return (lo + hi) / 2.0
+
+
+# ------------------------------------------------------------------ item 1: delay regimes + matrix ------------
+@pytest.mark.parametrize("delay", DELAYS)
+def test_delay_yaml_w_covers_cap_and_lam_matches_the_median(delay):
+    d = _yaml(f"configs/{delay}.yaml")["delay"]
+    p = d["params"]
+    assert d["maturity_window_days"] >= p["cap_days"], "W < cap: late frauds would hide inside N"
+    lam = _yaml("configs/benchmark.yaml")["benchmark"]["lam_by_delay"][delay]
+    median = _trunc_weibull_median(p["shape"], p["scale_days"], p["cap_days"])
+    assert lam == pytest.approx(math.log(2.0) / median, rel=0.03)
+
+
+def test_delay_very_high_values():
+    d = _yaml("configs/delay_very_high.yaml")["delay"]
+    assert d["mode"] == "weibull" and d["maturity_window_days"] == 45 and d["params"]["cap_days"] == 45
+
+
+def test_benchmark_matrix_is_72_plus_18_and_every_delay_has_a_config():
+    rb = _load_run_benchmark()
+    bench = _yaml("configs/benchmark.yaml")["benchmark"]
+    plan = rb.build_plan(bench)
+    methods, oracle = [s for s in plan if not s.oracle], [s for s in plan if s.oracle]
+    assert (len(methods), len(oracle), len(plan)) == (72, 18, 90)
+    assert [s.oracle for s in plan] == [False] * 72 + [True] * 18          # oracle runs LAST
+    assert {s.delay for s in plan} == set(DELAYS)
+    assert {s.backbone for s in methods} == {"sage", "gat"}
+    assert {s.loss for s in methods} == {"naive_bce", "maturity_mask", "delay_ipw", "tw_nndf"}
+    assert {s.seed for s in plan} == {42, 43, 44}
+    for d in DELAYS:
+        assert (ROOT / "configs" / f"{d}.yaml").exists()
+        assert bench["lam_by_delay"][d] is not None
+
+
+# ------------------------------------------------------------------ item 3: configs ---------------------------
+@pytest.mark.parametrize("name", ["base.yaml", "base_nnpu.yaml"])
+def test_both_base_configs_are_hybrid_sliding_unlabeled_with_t_floor(name):
+    loss = _yaml(f"configs/{name}")["loss"]
+    t = loss["tw_nndf"]
+    assert t["variant"] == "hybrid" and t["prior_mode"] == "sliding_unlabeled"
+    assert t["calibration"]["t_min"] >= 0.5
+    assert loss["maturity_mask"]["amount_aware"] is False                 # C12 locked for the main matrix
+
+
+def test_unlabeled_prior_uses_only_numerical_epsilon():
+    # An under-estimated pooled prior can yield a non-positive raw estimate.
+    # It is clipped only to PRIOR_EPS, never to a floor informed by hidden fraud labels.
+    assert unlabeled_prior_raw(0.01, 100, 1000) < 0
+    assert unlabeled_prior(0.01, 100, 1000) == pytest.approx(PRIOR_EPS)
+    # Normal case: (0.05 * 1040 - 40) / 1000 = 0.012 stays untouched.
+    assert unlabeled_prior(0.05, 40, 1000) == pytest.approx(0.012)
+    # An explicit zero floor still leaves the numerical epsilon safeguard.
+    assert unlabeled_prior(0.01, 100, 1000, min_prior=0.0) == pytest.approx(PRIOR_EPS)
+
+
+# ------------------------------------------------------------------ item 2: temperature floor -----------------
+def test_temperature_floor_is_clamped_and_logged():
+    assert MatureTemperatureTracker().t_min == T_MIN_DEFAULT == 0.5
+    g = torch.Generator().manual_seed(0)
+    z0 = torch.randn(20000, generator=g) * 2.0
+    y = torch.bernoulli(torch.sigmoid(z0), generator=g)
+    tracker = MatureTemperatureTracker()
+    for _ in range(3):                                   # 3 "epochs" of under-confident logits (optimal T ~ 0.3)
+        tracker.collect(0.3 * z0, y)
+        t = tracker.refit()
+        assert t >= 0.5 - 1e-6
+    assert tracker.last_raw_temperature is not None and tracker.last_raw_temperature < 0.5
+    assert tracker.temperature == pytest.approx(0.5, abs=1e-5) and tracker.floor_hits == 3
+
+
+def test_temperature_above_the_floor_is_not_touched():
+    g = torch.Generator().manual_seed(1)
+    z0 = torch.randn(20000, generator=g) * 2.0
+    y = torch.bernoulli(torch.sigmoid(z0), generator=g)
+    tracker = MatureTemperatureTracker()
+    tracker.collect(3.0 * z0, y)                         # over-confident: optimal T ~ 3
+    assert 2.0 < tracker.refit() <= 4.0 and tracker.floor_hits == 0
+
+
+# ------------------------------------------------------------------ item 5: C6 (pu_only) ----------------------
+VOCAB = {"card": 40, "device": 25}
+BS, HIST, IN_DIM = 16, 3, 16
+
+
+def _toy_batch(seed: int) -> HeteroData:
+    g = torch.Generator().manual_seed(seed)
+    n = BS * (1 + HIST)
+    owner = torch.cat([torch.arange(BS), torch.arange(BS).repeat_interleave(HIST)])
+    seed_time = 10_000_000 + torch.arange(BS, dtype=torch.long) * 7_200
+    j = torch.cat([torch.zeros(BS, dtype=torch.long), torch.arange(HIST).repeat(BS)])
+    time = torch.where(torch.arange(n) < BS, seed_time[owner], seed_time[owner] - (HIST - j + 1) * 86_400)
+    pnu = torch.full((n,), N).long()
+    pnu[:2] = P
+    pnu[9:BS] = U
+    batch = HeteroData()
+    t = batch[TXN]
+    t.x = torch.randn(n, IN_DIM, generator=g)
+    t.time, t.batch, t.batch_size = time, owner, BS
+    t.pnu = pnu
+    t.y_obs = (pnu == P).long()
+    t.in_train_view = torch.ones(n, dtype=torch.bool)
+    t.amount = torch.rand(n, generator=g) * 100 + 1
+    t.y_true = t.y_obs.clone()
+    t.y_true[[14, 15]] = 1
+    hist_idx = torch.arange(BS, n)
+    for e, size in VOCAB.items():
+        ent = batch[e]
+        ent.node_id = torch.randint(0, size, (BS,), generator=g)
+        ent.batch = torch.arange(BS)
+        ent.time = seed_time - 5 * 86_400
+        rev, fwd = (e, f"rev_uses_{e}", TXN), (TXN, f"uses_{e}", e)
+        batch[rev].edge_index = torch.stack([torch.arange(BS), torch.arange(BS)])
+        batch[rev].timestamp = seed_time.clone()
+        batch[fwd].edge_index = torch.stack([hist_idx, owner[hist_idx]])
+        batch[fwd].timestamp = time[hist_idx]
+    return batch
+
+
+class _FakeDS:
+    def __init__(self, batches):
+        self.batches = batches
+        self.data = SimpleNamespace(label_cut=10_000_000.0 + 40 * 86_400.0)
+
+    def __iter__(self):
+        return iter(self.batches)
+
+    def __len__(self):
+        return len(self.batches)
+
+
+def _fit(loss_fn):
+    bb = ModularTemporalGNN(in_dim=IN_DIM, entity_vocab_sizes=VOCAB, hidden_dim=16, num_layers=2, dropout=0.0,
+                            entity_embedding_dim=8, max_history=2, use_temporal=False)
+    cfg = TrainConfig(loss="tw_nndf", epochs=2, warmup_epochs=1, patience=2, device="cpu")
+    logs: list[str] = []
+    res = Trainer(FraudClassifier(bb, dropout=0.0), loss_fn, _FakeDS([_toy_batch(s) for s in range(3)]),
+                  _FakeDS([_toy_batch(10)]), cfg, log=logs.append).fit()
+    return res, logs
+
+
+def test_variant_pu_only_logs_bce_zero_and_does_not_crash():
+    torch.manual_seed(0)
+    res, logs = _fit(TimeWindowNNDFLoss(prior=0.1, mode="nnpu"))            # variant = pu_only
+    nndf_lines = [ln for ln in logs if "nndf" in ln]
+    for ln in nndf_lines:
+        print(ln)
+    assert len(nndf_lines) == 2 and all("bce=0.0000" in ln for ln in nndf_lines)
+    assert all(h["nndf_bce"] == 0.0 for h in res["history"])
+
+
+def test_variant_hybrid_has_a_positive_bce():
+    torch.manual_seed(0)
+    res, logs = _fit(HybridTWnnDFLoss(prior=0.1, mode="nnpu", lambda_pu=0.3))
+    assert all(h["nndf_bce"] > 0.0 for h in res["history"])
+    assert all("bce=0.0000" not in ln for ln in logs if "nndf" in ln)
+
+================================================================================
+
+FILE: tests\test_v2_dummy.py
+
+================================================================================
+
+import torch
+import yaml
+from src.losses.tw_nndf import HybridTWnnDFLoss
+from src.graph.builder import PNU_CODES
+from scripts.run_benchmark import build_plan
+
+PNU_P, PNU_U, PNU_N = PNU_CODES["P"], PNU_CODES["U"], PNU_CODES["N"]
+
+
+def make_batch(n_p=2, n_n=2, n_u=6, u_logit=0.0):
+    """Tạo batch giả với số lượng P, N, U tùy chỉnh."""
+    n = n_p + n_n + n_u
+    pnu = torch.cat([
+        torch.full((n_p,), PNU_P),
+        torch.full((n_n,), PNU_N),
+        torch.full((n_u,), PNU_U),
+    ]).long()
+    y = (pnu == PNU_P).long()
+    age = torch.rand(n) * 10
+    view = torch.ones(n, dtype=torch.bool)
+
+    logits = torch.randn(n)
+    logits[pnu == PNU_U] = u_logit
+    return logits, y, pnu, age, view
+
+
+def call(loss_fn, batch):
+    logits, y, pnu, age, view = batch
+    return loss_fn(logits, y, pnu, age_days=age, in_train_view=view)
+
+
+print("Bắt đầu chạy V2 Dummy Smoke Test...")
+
+# 1. Defaults must preserve V1.5 behavior.
+batch = make_batch()
+a = call(HybridTWnnDFLoss(0.05, lambda_pu=0.3), batch)
+b = call(HybridTWnnDFLoss(0.05, lambda_pu=0.3, bce_pos_weight=1.0, u_conf_filter=False), batch)
+assert torch.equal(a, b)
+print("  [PASS] 1. Default parameters preserve V1.5 behavior.")
+
+# 2. pos_weight must match BCEWithLogitsLoss on the BCE population.
+logits, y, pnu, age, view = make_batch()
+loss_fn = HybridTWnnDFLoss(0.05, lambda_pu=0.0, bce_pos_weight=3.0)
+actual = call(loss_fn, (logits, y, pnu, age, view))
+keep = pnu != PNU_U
+expected = torch.nn.BCEWithLogitsLoss(pos_weight=torch.tensor(3.0))(logits[keep], y[keep].float())
+assert torch.allclose(actual, expected, atol=1e-6)
+print("  [PASS] 2. pos_weight matches BCEWithLogitsLoss.")
+
+# 3. All U in the grey zone: PU contribution is zero, but BCE still has a valid gradient.
+batch = make_batch(u_logit=0.0)
+logits, y, pnu, age, view = batch
+logits = logits.clone().requires_grad_(True)
+loss_fn = HybridTWnnDFLoss(0.05, lambda_pu=0.5, u_conf_filter=True)
+out = call(loss_fn, (logits, y, pnu, age, view))
+assert torch.isfinite(out)
+out.backward()
+assert torch.isfinite(logits.grad).all()
+assert torch.all(logits.grad[pnu == PNU_U] == 0)
+assert float(loss_fn.last_risks["u_kept_frac"]) == 0.0
+assert float(loss_fn.last_risks["pu_loss"]) == 0.0
+print("  [PASS] 3. Grey-zone U rows produce zero PU contribution.")
+
+# 4. Only high-confidence U rows should be retained.
+batch = make_batch(u_logit=0.0)
+logits, y, pnu, age, view = batch
+logits = logits.clone()
+u_idx = (pnu == PNU_U).nonzero().squeeze(1)
+logits[u_idx[:2]] = 3.0
+logits[u_idx[2:4]] = -3.0
+loss_fn = HybridTWnnDFLoss(0.05, lambda_pu=0.5, u_conf_filter=True)
+_ = call(loss_fn, (logits, y, pnu, age, view))
+assert abs(float(loss_fn.last_risks["u_kept_frac"]) - 4 / 6) < 1e-6
+print("  [PASS] 4. Only confident U rows are retained.")
+
+# 5. Benchmark config must expand to 15 unique runs (6 baselines + 9 V2 variants).
+with open("configs/benchmark_v2_probe.yaml", encoding="utf-8") as f:
+    bench = yaml.safe_load(f)["benchmark"]
+plan = build_plan(bench)
+assert len(plan) == 15
+assert len({s.run_id for s in plan}) == 15
+
+baseline = [s for s in plan if s.variant is None]
+variants = [s for s in plan if s.variant is not None]
+
+assert len(baseline) == 6 and len(variants) == 9
+assert {s.loss for s in baseline} == {"naive_bce", "maturity_mask"}
+assert {s.variant for s in variants} == {"v2_light", "v2_imbalance", "v2_conf"}
+assert {s.seed for s in plan} == {42, 43, 44}
+assert {s.delay for s in plan} == {"delay_high"}
+assert {s.backbone for s in plan} == {"sage"}
+assert {s.use_temporal for s in plan} == {False}
+print("  [PASS] 5. Config expands to 15 unique runs (6 baselines + 9 variants).")
+
+print("\\n=> V2 DUMMY SMOKE TEST: PASS TOÀN BỘ!")
+
+================================================================================
+
+FILE: tests\test_v2_final.py
+
+================================================================================
+
+"""V2 final regression tests: validation-only thresholding and variant-aware analysis."""
+from __future__ import annotations
+
+import csv
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+torch = pytest.importorskip("torch")
+yaml = pytest.importorskip("yaml")
+pytest.importorskip("torch_geometric")
+
+from scripts.run_benchmark import build_plan  # noqa: E402
+from src.eval import analyzer as A  # noqa: E402
+import src.train.trainer as trainer_module  # noqa: E402
+from src.train.trainer import Trainer  # noqa: E402
+
+
+def test_test_recall_uses_validation_threshold_and_never_fits_test_threshold(monkeypatch):
+    """A test-set-derived threshold would return a different recall on this deliberately chosen example."""
+    trainer = Trainer.__new__(Trainer)
+    trainer.model = object()
+    trainer.device = torch.device("cpu")
+    trainer.cfg = SimpleNamespace(review_cost=0.0, fpr=0.01)
+
+    test_output = {
+        "y_true": [1, 0, 1, 0],
+        "scores": [0.6, 0.7, 0.4, 0.1],
+        "amount": [100.0, 1.0, 50.0, 1.0],
+    }
+
+    def fake_predict(model, dataset, device):
+        return test_output
+
+    def forbidden_test_threshold(*args, **kwargs):
+        pytest.fail("Test evaluation must not call summarize_scores / fit a threshold on test labels.")
+
+    monkeypatch.setattr(trainer_module, "predict", fake_predict)
+    monkeypatch.setattr(trainer_module.M, "summarize_scores", forbidden_test_threshold)
+
+    validation_threshold = 0.5
+    result = trainer.evaluate_test(object(), validation_threshold)
+
+    # Applying the validation threshold flags scores 0.6 and 0.7: one of two frauds.
+    assert result["val_threshold_applied"] == pytest.approx(validation_threshold)
+    assert result["op_threshold"] == pytest.approx(validation_threshold)
+    assert result["recall_at_fpr"] == pytest.approx(0.5)
+    assert result["op_recall"] == pytest.approx(0.5)
+    assert result["op_fpr"] == pytest.approx(0.5)
+    assert "threshold_at_fpr" not in result
+
+
+def _row(run_id, loss, variant, seed, pr_auc, efl):
+    return {
+        "run_id": run_id,
+        "status": "ok",
+        "delay": "delay_high",
+        "loss": loss,
+        "variant": variant or "",
+        "backbone": "sage",
+        "use_temporal": "False",
+        "lp_features": "False",
+        "seed": str(seed),
+        "test_pr_auc": str(pr_auc),
+        "test_roc_auc": "0.9",
+        "test_recall_at_fpr": "0.25",
+        "test_efl_ratio": str(efl),
+        "prereg_status": "unfrozen",
+        "cfg_hash": "v2-test",
+        "prior_override": "",
+    }
+
+
+def test_analyzer_keeps_v2_variants_separate(tmp_path):
+    rows = []
+    for i, seed in enumerate((42, 43, 44)):
+        rows.append(_row(f"a0_{seed}", "naive_bce", None, seed, 0.30 + i * 0.01, 0.70 - i * 0.01))
+        rows.append(_row(f"light_{seed}", "tw_nndf", "v2_light", seed, 0.40 + i * 0.01, 0.60 - i * 0.01))
+        rows.append(_row(f"imb_{seed}", "tw_nndf", "v2_imbalance", seed, 0.45 + i * 0.01, 0.55 - i * 0.01))
+
+    parsed, warnings = A.clean_rows(rows)
+    values = A.collect_values(parsed)
+    variant_cells = [c for c in values if c.loss == "tw_nndf"]
+    assert len(variant_cells) == 2
+    assert {c.variant for c in variant_cells} == {"v2_light", "v2_imbalance"}
+    assert all(len(values[c]["test_pr_auc"]) == 3 for c in variant_cells)
+
+    result = A.run_analysis(rows, tmp_path, plots=False)
+    with (Path(tmp_path) / "summary.csv").open(newline="", encoding="utf-8") as f:
+        summary = list(csv.DictReader(f))
+    tw_rows = [r for r in summary if r["loss"] == "tw_nndf" and r["metric"] == "test_pr_auc"]
+    assert len(tw_rows) == 2
+    assert {r["variant"] for r in tw_rows} == {"v2_light", "v2_imbalance"}
+    diag_variants = {r["variant"] for r in result["nndf"]}
+    assert diag_variants == {"v2_light", "v2_imbalance"}
+
+
+def test_v2_probe_expands_to_exactly_15_non_temporal_runs():
+    root = Path(__file__).resolve().parents[1]
+    config = yaml.safe_load((root / "configs" / "benchmark_v2_probe.yaml").read_text(encoding="utf-8"))
+    plan = build_plan(config["benchmark"])
+
+    assert len(plan) == 15
+    assert len({spec.run_id for spec in plan}) == 15
+    assert all(spec.delay == "delay_high" for spec in plan)
+    assert all(spec.backbone == "sage" for spec in plan)
+    assert all(spec.use_temporal is False for spec in plan)
+
+    baselines = [spec for spec in plan if spec.variant is None]
+    variants = [spec for spec in plan if spec.variant is not None]
+    assert len(baselines) == 6
+    assert len(variants) == 9
+    assert {spec.loss for spec in baselines} == {"naive_bce", "maturity_mask"}
+    assert {spec.variant for spec in variants} == {"v2_light", "v2_imbalance", "v2_conf"}
+    assert {spec.seed for spec in plan} == {42, 43, 44}
+
+================================================================================
+
 FILE: README.md
 
 ================================================================================
 
-# TW-PU-TGNN / DelayGraphBench
+# DelayGraphBench / TW-PU-TGNN
 
-Temporal heterogeneous GNN for transaction fraud under **delayed (immature) labels** on IEEE-CIS.
-It compares feature-level ATLAS-style label-propagation features against loss-level methods
-(Maturity Masking, Delay-IPW, TW-nnDF), with a naive baseline **A0** and an **oracle**.
+Continuous-time heterogeneous transaction graphs for fraud detection under **label delay** on IEEE-CIS.
+The V2 protocol compares Naive BCE, Maturity-Masked BCE, Delay-IPW and TW-nnDF. Hetero-GraphSAGE is the
+main backbone; Hetero-GAT is the secondary backbone check. The V2 architecture does **not** use GRU, TGN,
+EvolveGCN or domain adaptation.
 
 > Status: the benchmark run matrix and thresholds are **NOT pre-registered/frozen yet**
 > (`src.train.utils.PREREG_STATUS = "unfrozen"`). Every result row and every LaTeX caption carries this status.
 > Nothing here is a reproduction of a published system; "ATLAS-style" means lag-safe LP features inspired by ATLAS.
 
 ## Layout
-configs/ (base.yaml, delay_low.yaml, delay_high.yaml, benchmark.yaml) | src/data, src/graph, src/features,
-src/models, src/losses, src/train, src/eval | scripts/ | tests/ | results/
+
+`configs/` | `src/data/` | `src/graph/` | `src/features/` | `src/models/` | `src/losses/` |
+`src/train/` | `src/eval/` | `scripts/` | `tests/` | `results/`
 
 ## Setup
-pip install torch torch_geometric pyg-lib (pyg-lib is REQUIRED: the temporal sampler needs it), pandas, pyyaml, pytest.
-Use versions that match your torch/CUDA build.
 
-## Protocol (what is fixed in code)
-* Labels at cut `t_train`: P = reported fraud, N = mature unreported, U = immature unreported.
-* Train graph hides `y_true`; the oracle run is the only one that keeps it (`expose_train_true_labels`).
-* Validation uses full `y_true` to pick the best epoch and the FPR=1% threshold; test is scored once.
-* Scores are logits. EFL = missed fraud amount + review_cost x #FP (review_cost = 0 by default; EFL is our definition).
-* A method counts as an improvement only if its seed-mean (PR-AUC or EFL) is outside the 95% CI of A0.
-* Recovery Ratio = (S_method - S_A0) / (S_oracle - S_A0), reported only if the oracle-A0 gap exceeds A0's 95% CI.
+Install PyTorch, a matching PyG build (including the sampler dependencies required by your environment),
+pandas, PyYAML, and pytest. Use versions that match your torch/CUDA build.
+
+## V2 protocol
+
+* Continuous timestamps are retained at transaction-level resolution.
+* P = reported fraud, N = mature unreported, U = immature unreported at the training label cut.
+* The train graph hides `y_true`; only the explicitly labelled oracle run may expose it.
+* Hetero-GraphSAGE is the main model and Hetero-GAT is the comparator. `model.use_temporal: false` is required:
+  no recurrent GRU branch is active.
+* Temporal causality is enforced by the graph sampler (`strict_time: true`): sampled neighbours must be earlier
+  than the seed transaction.
+* TW-nnDF combines maturity-masked BCE with cost-sensitive nnPU. Amount thresholds and amount references are
+  fitted on the training view only. The unlabeled prior is estimated from observed training labels and bounded
+  only by the numerical `PRIOR_EPS`; no floor based on hidden fraud prevalence is permitted.
+* Validation selects the best epoch and fits the FPR operating threshold. Test PR-AUC/ROC-AUC are ranking metrics;
+  test Recall/FPR and EFL are computed by applying that **validation-fitted threshold**. A threshold is never fitted
+  on test labels.
+* `negative_risk_rate` records batches with negative raw nnPU negative risk. `nnpu_ascent_rate` records batches
+  using the nnPU ascent branch. `zero_pu_rate` records batches with no valid P/U contribution. These are distinct
+  diagnostics; a negative raw risk is not synonymous with a clamped objective in nnPU mode.
+* Scores are logits. EFL = missed fraud amount + `review_cost` × FP count (`review_cost = 0` by default; freeze
+  the business cost before interpreting EFL as a deployment metric).
+* A method counts as an improvement only if its seed-mean (PR-AUC or EFL ratio) is outside the 95% CI of A0.
+* Recovery Ratio = `(S_method - S_A0) / (S_oracle - S_A0)`, reported only if the oracle-A0 gap exceeds A0's 95% CI.
+* Main benchmark: 4 methods × 2 backbones × 3 delay regimes × 3 seeds = 72 method runs, followed by 18 oracle runs.
+  The V2 probe config is a separate 15-run matrix: 2 baselines × 3 seeds plus 3 TW-nnDF variants × 3 seeds.
 * 3 seeds (42, 43, 44), Student-t CI (t = 4.303 for n = 3). GPU runs are not bit-reproducible.
 
 ## Known limits
-* The prior estimated for tw_nndf (~3.5%) differs from the true fraud rate in U (1.39% delay_high, 1.82% delay_low):
-  the clamp rate is logged per run (`nndf_clamped_*`) and summarised in `results/analysis/nndf_diagnostics.csv`.
+
+* The prior estimated from mature observed training labels can differ from the true hidden-fraud rate in U.
+  The true rate is a post-hoc diagnostic only; it must never determine the prior floor or training objective.
+* Cost-sensitive weighting assumes the amount distribution used for weighting is informative for the hidden-positive
+  population. Amount-dependent reporting delays can violate this assumption and must be treated as a threat to validity.
+* Confidence-filtering U changes the selected-U distribution and can bias the prior; `v2_conf` is a heuristic ablation,
+  not an unbiased nnPU estimator.
 * LP features are counted on sampled neighbours (fan-out limited); only seed nodes carry them.
 * Test results of different delay settings are not comparable in absolute value unless the test set is identical.
 
 ## Steps (commands are for you to run)
-1. Data:      python scripts/prepare_data.py --delay_config configs/delay_high.yaml  (and delay_low)
-2. Tests:     pytest -q
-3. Profile:   python scripts/profile_epoch.py --processed_dir data/processed/delay_high --device cuda
-4. Plan:      python scripts/run_benchmark.py --dry_run --est_epoch_minutes <measured>
-5. Smoke:     python scripts/run_benchmark.py --smoke --seeds 42 --delays delay_high
-6. Benchmark: python scripts/run_benchmark.py --max_hours 10          # re-run the same command to resume
-7. Analysis:  python -m src.eval.analyzer --results results/benchmark_results.csv --out results/analysis
 
-Fill `lam_by_delay` in configs/benchmark.yaml before step 6 (lambda = ln2 / median delay in days, per delay).
+1. Data: `python scripts/prepare_data.py --delay_config configs/delay_high.yaml` (and other delay regimes)
+2. Tests: `pytest -q`
+3. Profile: `python scripts/profile_epoch.py --processed_dir data/processed/delay_high --device cuda`
+4. Plan: `python scripts/run_benchmark.py --dry_run --est_epoch_minutes <measured>`
+5. Smoke: `python scripts/run_benchmark.py --smoke --seeds 42 --delays delay_high`
+6. Benchmark: `python scripts/run_benchmark.py --max_hours 10` (re-run the same command to resume)
+7. Analysis: `python -m src.eval.analyzer --results results/benchmark_results.csv --out results/analysis`
+
+Fill `lam_by_delay` in `configs/benchmark.yaml` before the main benchmark (lambda = ln2 / median delay in days,
+per delay).
 
 ## Resuming across Kaggle sessions
-`results/benchmark_results.csv` is append-only (one fsynced row per finished run). Before a session ends,
-keep that file (download it, or save it as a Kaggle dataset). In the next session, pass it with
-`--seed_results <path>`; it is copied only if `results/benchmark_results.csv` does not exist yet.
-Check your own weekly GPU quota and session limit; they are not assumed here.
-If you change anything in train/model/sampler/eval/loss/features or lam_by_delay, the runner refuses to
-continue on the old CSV (config hash); use a new --results file.
 
-## Outputs (results/analysis)
-summary.csv, recovery.csv, nndf_diagnostics.csv, table_main_<delay>.tex, table_recovery.tex,
-fig_test_pr_auc.pdf, fig_test_efl_ratio.pdf, figures.tex.
+`results/benchmark_results.csv` is append-only (one fsynced row per finished run). Before a session ends,
+keep that file (download it, or save it as a Kaggle dataset). In the next session, pass it with `--seed_results <path>`;
+it is copied only if `results/benchmark_results.csv` does not exist yet. Check your own weekly GPU quota and session
+limit; they are not assumed here.
+
+If you change anything in train/model/sampler/eval/loss/features or `lam_by_delay`, the runner refuses to continue
+on the old CSV (config hash); use a new `--results` file.
+
+## Outputs (`results/analysis`)
+
+`summary.csv`, `recovery.csv`, `nndf_diagnostics.csv`, `table_main_<delay>.tex`, `table_recovery.tex`,
+`fig_test_pr_auc.pdf`, `fig_test_efl_ratio.pdf`, `figures.tex`.
 
 ================================================================================
 
@@ -8309,9 +9743,11 @@ results/*
 results/analysis/*.png
 results/analysis/*.pdf
 results/runs/
-results/smoke/
 results/profile/
 *.log
+
+# Giữ smoke CSV (nếu muốn giữ kết quả smoke run)
+!results/smoke/*.csv
 
 # Các output đặc thù của Kaggle (nếu có)
 figures/
@@ -8353,3 +9789,6 @@ secrets.*
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ---------- Giữ file kết quả benchmark ở gốc (nếu có) ----------
+!benchmark_results*.csv

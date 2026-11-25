@@ -1,4 +1,4 @@
-"""V1.5 preflight fixes: delay_very_high, benchmark matrix (72 + 18), sliding_unlabeled, T >= 0.5, prior floor,
+"""V1.5 preflight fixes: delay_very_high, benchmark matrix (72 + 18), sliding_unlabeled, T >= 0.5, train-only prior epsilon,
 and the C6 check (variant=pu_only logs bce=0.0000 without crashing). CPU only, no real data.
 
 Run the C6 part alone and see the log lines:  pytest -q -s tests/test_v15_preflight_fixes.py -k pu_only
@@ -20,7 +20,7 @@ from torch_geometric.data import HeteroData  # noqa: E402
 
 from src.graph.builder import PNU_CODES, TXN  # noqa: E402
 from src.losses.calibration import (  # noqa: E402
-    MIN_UNLABELED_PRIOR, T_MIN_DEFAULT, MatureTemperatureTracker, unlabeled_prior, unlabeled_prior_raw,
+    PRIOR_EPS, T_MIN_DEFAULT, MatureTemperatureTracker, unlabeled_prior, unlabeled_prior_raw,
 )
 from src.losses.tw_nndf import HybridTWnnDFLoss, TimeWindowNNDFLoss  # noqa: E402
 from src.models.classifier import FraudClassifier  # noqa: E402
@@ -97,14 +97,15 @@ def test_both_base_configs_are_hybrid_sliding_unlabeled_with_t_floor(name):
     assert loss["maturity_mask"]["amount_aware"] is False                 # C12 locked for the main matrix
 
 
-def test_unlabeled_prior_floor():
-    # pooled prior under-estimated: raw hidden rate < 0 -> the floor applies (not 1e-4)
+def test_unlabeled_prior_uses_only_numerical_epsilon():
+    # An under-estimated pooled prior can yield a non-positive raw estimate.
+    # It is clipped only to PRIOR_EPS, never to a floor informed by hidden fraud labels.
     assert unlabeled_prior_raw(0.01, 100, 1000) < 0
-    assert unlabeled_prior(0.01, 100, 1000) == pytest.approx(MIN_UNLABELED_PRIOR)
-    # normal case: (0.05 * 1040 - 40) / 1000 = 0.012 stays untouched
+    assert unlabeled_prior(0.01, 100, 1000) == pytest.approx(PRIOR_EPS)
+    # Normal case: (0.05 * 1040 - 40) / 1000 = 0.012 stays untouched.
     assert unlabeled_prior(0.05, 40, 1000) == pytest.approx(0.012)
-    # min_prior = 0 reproduces the old behaviour (only the eps clip)
-    assert unlabeled_prior(0.01, 100, 1000, min_prior=0.0) == pytest.approx(1e-4)
+    # An explicit zero floor still leaves the numerical epsilon safeguard.
+    assert unlabeled_prior(0.01, 100, 1000, min_prior=0.0) == pytest.approx(PRIOR_EPS)
 
 
 # ------------------------------------------------------------------ item 2: temperature floor -----------------
@@ -184,7 +185,7 @@ class _FakeDS:
 
 def _fit(loss_fn):
     bb = ModularTemporalGNN(in_dim=IN_DIM, entity_vocab_sizes=VOCAB, hidden_dim=16, num_layers=2, dropout=0.0,
-                            entity_embedding_dim=8, max_history=2, use_temporal=True)
+                            entity_embedding_dim=8, max_history=2, use_temporal=False)
     cfg = TrainConfig(loss="tw_nndf", epochs=2, warmup_epochs=1, patience=2, device="cpu")
     logs: list[str] = []
     res = Trainer(FraudClassifier(bb, dropout=0.0), loss_fn, _FakeDS([_toy_batch(s) for s in range(3)]),

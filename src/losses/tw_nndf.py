@@ -190,12 +190,14 @@ class TimeWindowNNDFLoss(nn.Module):
 
 
 class HybridTWnnDFLoss(TimeWindowNNDFLoss):
-    """``bce + lambda_pu * pu`` as described in the module docstring.
+    """Maturity-masked BCE + lambda_pu * nnPU.
 
-    Extra args: ``lambda_pu`` (>= 0), ``amount_threshold`` (p95 of the TRAIN amounts from the trainer; ``None``
-    disables amount-aware masking), ``amount_min_age_days``, ``calibrator`` (``MatureTemperatureTracker`` or
-    ``None``), ``sliding_prior`` (object with ``query(age_days)``, e.g. ``SlidingWindowPrior``; ``None`` -> the
-    fixed scalar ``prior``).
+    V2 additions:
+      - bce_pos_weight: positive-class weight in the BCE term only.
+      - u_conf_filter: retain only confident U rows in the PU term.
+      - u_conf_hi / u_conf_lo: confidence thresholds; 0 < lo < hi < 1.
+
+    Defaults preserve the V1.5 loss behavior.
     """
 
     def __init__(
@@ -214,29 +216,61 @@ class HybridTWnnDFLoss(TimeWindowNNDFLoss):
         amount_min_age_days: float = 0.0,
         calibrator: Any | None = None,
         sliding_prior: AgePrior | None = None,
+        bce_pos_weight: float = 1.0,
+        u_conf_filter: bool = False,
+        u_conf_hi: float = 0.80,
+        u_conf_lo: float = 0.10,
     ) -> None:
         if tuple(unlabeled_statuses) != ("U",):
-            raise ValueError("hybrid variant: unlabeled_statuses must be ('U',) (N feeds the BCE term).")
-        super().__init__(prior, unlabeled_statuses, mode, beta, gamma, amount_weighted, amount_ref, max_weight)
+            raise ValueError(
+                "hybrid variant: unlabeled_statuses must be ('U',) (N feeds the BCE term)."
+            )
+
+        super().__init__(
+            prior, unlabeled_statuses, mode, beta, gamma,
+            amount_weighted, amount_ref, max_weight,
+        )
+
         if lambda_pu < 0:
             raise ValueError("lambda_pu must be >= 0.")
         if amount_threshold is not None and amount_threshold <= 0:
             raise ValueError("amount_threshold must be > 0.")
         if amount_min_age_days < 0:
             raise ValueError("amount_min_age_days must be >= 0.")
+        if bce_pos_weight <= 0:
+            raise ValueError("bce_pos_weight must be > 0.")
+        if not 0.0 < u_conf_lo < u_conf_hi < 1.0:
+            raise ValueError("need 0 < u_conf_lo < u_conf_hi < 1.")
+
         self.lambda_pu = float(lambda_pu)
-        self.amount_threshold = None if amount_threshold is None else float(amount_threshold)
+        self.amount_threshold = (
+            None if amount_threshold is None else float(amount_threshold)
+        )
         self.amount_min_age_days = float(amount_min_age_days)
         self.calibrator = calibrator
         self.sliding_prior = sliding_prior
+
+        self.bce_pos_weight = float(bce_pos_weight)
+        self.u_conf_filter = bool(u_conf_filter)
+        self.u_conf_hi = float(u_conf_hi)
+        self.u_conf_lo = float(u_conf_lo)
 
     @property
     def needs_amount(self) -> bool:
         return self.amount_weighted or self.amount_threshold is not None
 
     def end_epoch(self) -> float | None:
-        """Called by the trainer after each training epoch: refit ``T`` on the TRAIN rows collected so far."""
+        """Refit temperature using mature TRAIN rows collected during this epoch."""
         return None if self.calibrator is None else self.calibrator.refit()
+
+    def _bce(self, logits: Tensor, target: Tensor) -> Tensor:
+        # Preserve the original V1.5 numerical path when pos_weight == 1.
+        if self.bce_pos_weight == 1.0:
+            return F.binary_cross_entropy_with_logits(logits, target)
+
+        return nn.BCEWithLogitsLoss(
+            pos_weight=logits.new_tensor(self.bce_pos_weight)
+        )(logits, target)
 
     def forward(
         self,
@@ -248,50 +282,136 @@ class HybridTWnnDFLoss(TimeWindowNNDFLoss):
         in_train_view: Tensor | None = None,
         amount: Tensor | None = None,
     ) -> Tensor:
-        preds, _, pnu, view = prepare_inputs(preds, y_obs, pnu_status, in_train_view)
+        preds, _, pnu, view = prepare_inputs(
+            preds, y_obs, pnu_status, in_train_view
+        )
         amt = None if amount is None else amount.reshape(-1).to(preds.device)
+
+        # ---- trusted negatives ------------------------------------------------
         trusted = torch.zeros_like(view)
         if self.amount_threshold is not None:
             if amt is None:
                 raise ValueError("amount_threshold is set: `amount` is required.")
             trusted = view & trusted_negative_mask(
-                pnu, amt, age_days, self.amount_threshold, self.amount_min_age_days
+                pnu, amt, age_days,
+                self.amount_threshold,
+                self.amount_min_age_days,
             )
 
-        # ---- BCE on the mature region: P=1, N=0, trusted U=0 ------------------------------------------------
+        # ---- BCE: P=1, N=0, trusted-U=0 --------------------------------------
         is_pos = view & (pnu == PNU_P)
-        keep = is_pos | (view & (pnu == PNU_N)) | trusted
-        has_keep = bool(keep.any())
-        bce = (
-            F.binary_cross_entropy_with_logits(preds[keep], is_pos[keep].to(preds.dtype))
-            if has_keep else zero_loss(preds)
-        )
-        if self.calibrator is not None and has_keep and self.training and torch.is_grad_enabled():
-            self.calibrator.collect(preds[keep].detach(), is_pos[keep])  # TRAIN mature rows only
+        keep_bce = is_pos | (view & (pnu == PNU_N)) | trusted
 
-        # ---- nnPU on P versus the remaining U, on calibrated logits -----------------------------------------
-        z = preds if self.calibrator is None else preds / self.calibrator.temperature
-        pnu_pu = torch.where(trusted, torch.full_like(pnu, PNU_N), pnu)  # trusted rows leave U
+        if bool(keep_bce.any()):
+            bce = self._bce(
+                preds[keep_bce],
+                is_pos[keep_bce].to(preds.dtype),
+            )
+        else:
+            bce = zero_loss(preds)
+
+        if (
+            self.calibrator is not None
+            and bool(keep_bce.any())
+            and self.training
+            and torch.is_grad_enabled()
+        ):
+            self.calibrator.collect(
+                preds[keep_bce].detach(),
+                is_pos[keep_bce],
+            )
+
+        # ---- PU: P versus remaining U, optionally calibrated -----------------
+        z = (
+            preds
+            if self.calibrator is None
+            else preds / self.calibrator.temperature
+        )
+
+        # Trusted U rows are treated as N for BCE and removed from PU.
+        pnu_pu = torch.where(
+            trusted,
+            torch.full_like(pnu, PNU_N),
+            pnu,
+        )
+        view_pu = view
+
+        u_raw = view & (pnu == PNU_U)
+        u_remaining = view & (pnu_pu == PNU_U)
+        u_kept = u_remaining
+
+        if self.u_conf_filter:
+            # Detach the selection decision: no gradient through the mask.
+            confidence = z.detach().sigmoid()
+            confident = (
+                (confidence > self.u_conf_hi)
+                | (confidence < self.u_conf_lo)
+            )
+            u_kept = u_remaining & confident
+
+            # Mask only U rows in the grey zone. P rows remain in PU.
+            view_pu = view & ~(u_remaining & ~confident)
+
+        n_u_remaining = u_remaining.sum().to(preds.dtype)
+        n_u_kept = u_kept.sum().to(preds.dtype)
+        kept_frac = torch.where(
+            n_u_remaining > 0,
+            n_u_kept / n_u_remaining.clamp_min(1.0),
+            preds.new_zeros(()),
+        )
+
+        # ---- Sliding prior on the actual U rows entering this PU batch -------
         pi: Tensor | None = None
         if self.sliding_prior is not None:
             if age_days is None:
                 raise ValueError("sliding_prior is set: `age_days` is required.")
-            u_rows = view & (pnu_pu == PNU_U)
-            if bool(u_rows.any()):
-                age_u = age_days.reshape(-1).to(preds.device)[u_rows]
-                pi = self.sliding_prior.query(age_u).to(preds.dtype).mean().clamp(_PRIOR_EPS, 1.0 - _PRIOR_EPS)
-        parts = self.risks(z, y_obs, pnu_pu, in_train_view, amt, prior=pi)
-        zero = preds.detach().sum() * 0.0
+
+            if bool(u_kept.any()):
+                age_u = age_days.reshape(-1).to(preds.device)[u_kept]
+                pi = (
+                    self.sliding_prior.query(age_u)
+                    .to(preds.dtype)
+                    .mean()
+                    .clamp(_PRIOR_EPS, 1.0 - _PRIOR_EPS)
+                )
+
+        parts = self.risks(
+            z, y_obs, pnu_pu, view_pu, amt, prior=pi
+        )
+
+        # Connected zero is essential when confidence filtering removes all U
+        # (or when P/U is otherwise absent in this batch).
         if parts is None:
-            pu = zero
-            risks = {k: zero for k in ("pos_risk", "neg_risk_raw", "neg_risk", "clamped", "ascent", "prior_used")}
+            pu = zero_loss(preds)
+            zero = preds.new_zeros(())
+            risks = {
+                "pos_risk": zero,
+                "neg_risk_raw": zero,
+                "neg_risk": zero,
+                "clamped": zero,
+                "ascent": zero,
+                "prior_used": (
+                    preds.new_tensor(self.prior) if pi is None else pi
+                ).detach(),
+            }
         else:
             pu, ascent = self._pu_loss(parts)
             risks = {k: v.detach() for k, v in parts.items()}
             risks["ascent"] = ascent.detach()
-            risks["prior_used"] = (preds.new_tensor(self.prior) if pi is None else pi).detach()
-        risks["bce"] = bce.detach()
+            risks["prior_used"] = (
+                preds.new_tensor(self.prior) if pi is None else pi
+            ).detach()
+
+        risks.update({
+            "bce": bce.detach(),
+            "pu_loss": pu.detach(),
+            "u_raw_count": u_raw.sum().to(preds.dtype).detach(),
+            "u_pu_count": u_remaining.sum().to(preds.dtype).detach(),
+            "u_kept_count": n_u_kept.detach(),
+            "u_kept_frac": kept_frac.detach(),
+        })
         self.last_risks = risks
+
         return bce + self.lambda_pu * pu
 
 

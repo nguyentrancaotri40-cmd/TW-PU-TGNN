@@ -4,8 +4,10 @@ Invariants checked
   * naive_bce     : every U row has a NON-zero gradient (U is read as negative).
   * maturity_mask : every U row has exactly ZERO gradient and the loss value does not change when U
                     logits change.
-  * tw_nndf       : U rows have zero gradient ONLY while the negative-risk clamp is active
-                    (``neg_risk_raw < 0``); outside that regime the U gradient is non-zero by design.
+  * tw_nndf       : in clamp mode, negative raw negative-risk is clamped and its U contribution has zero
+                    gradient. In nnPU mode, a negative raw risk is NOT itself a clamp: when ``neg_risk_raw <
+                    -beta`` the ascent branch is used and U gradients remain active. The trainer reports
+                    negative-risk, nnPU-ascent and zero-PU batch rates separately.
   * model         : logits do not depend on label fields (y_obs, y_true, pnu) of the batch.
 """
 from __future__ import annotations

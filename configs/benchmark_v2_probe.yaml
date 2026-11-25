@@ -1,0 +1,61 @@
+benchmark:
+  seeds: [42, 43, 44]
+  delays: [delay_high]
+  backbone: sage
+  max_hours: 10.0
+
+  groups:
+    baselines:
+      enabled: true
+      backbone: sage
+      losses: [naive_bce, maturity_mask]
+      lp: false
+      use_temporal: false
+
+    v2_probe:
+      enabled: true
+      backbone: sage
+      losses: [tw_nndf]
+      lp: false
+      use_temporal: false
+
+      # All variants retain the SSOT cost-sensitive amount weighting and amount-aware trusted-U mask.
+      # The variants differ only in the selected V2 ablation dimension(s).
+      variants:
+        v2_light:
+          variant: hybrid
+          mode: nnpu
+          prior_mode: sliding_unlabeled
+          lambda_pu: 0.05
+          amount_weighted: true
+          amount_aware: true
+          amount_quantile: 0.95
+          amount_min_age_days: null
+          bce_pos_weight: 1.0
+          u_conf_filter: false
+
+        v2_imbalance:
+          variant: hybrid
+          mode: nnpu
+          prior_mode: sliding_unlabeled
+          lambda_pu: 0.05
+          amount_weighted: true
+          amount_aware: true
+          amount_quantile: 0.95
+          amount_min_age_days: null
+          bce_pos_weight: 3.0
+          u_conf_filter: false
+
+        v2_conf:
+          variant: hybrid
+          mode: nnpu
+          prior_mode: sliding_unlabeled
+          lambda_pu: 0.05
+          amount_weighted: true
+          amount_aware: true
+          amount_quantile: 0.95
+          amount_min_age_days: null
+          bce_pos_weight: 3.0
+          u_conf_filter: true
+          u_conf_hi: 0.80
+          u_conf_lo: 0.10

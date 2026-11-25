@@ -1,7 +1,3 @@
-# =====================================================================
-# FILE: scripts/run_benchmark.py
-# TRẠNG THÁI: ĐÃ SỬA (xóa định nghĩa lặp apply_prior_override; logic giữ nguyên)
-# =====================================================================
 #!/usr/bin/env python
 """Benchmark runner with auto-resume.
 
@@ -52,12 +48,14 @@ LOSSES = ("naive_bce", "maturity_mask", "delay_ipw", "tw_nndf")
 HASHED_SECTIONS = ("sampler", "model", "train", "eval", "loss", "features")
 
 RESULT_COLUMNS: list[str] = [
-    "run_id", "status", "group", "delay", "loss", "oracle", "backbone", "use_temporal", "lp_features", "seed",
+    "run_id", "status", "group", "delay", "loss", "variant", "oracle",
+    "backbone", "use_temporal", "lp_features", "seed",
     "prior_override", "in_dim", "n_params", "best_epoch", "epochs_run",
     "val_pr_auc", "val_roc_auc", "test_pr_auc", "test_roc_auc", "test_recall_at_fpr",
     "test_recall_at_valthr", "test_fpr_at_valthr", "test_efl", "test_efl_ratio",
     "lam", "nndf_prior", "nndf_prior_estimated", "diag_true_fraud_rate_in_U",
-    "nndf_clamped_best", "nndf_clamped_mean", "nndf_neg_risk_raw_best", "nndf_pos_risk_best", "n_empty_batches_total",
+    "nndf_clamped_best", "nndf_clamped_mean", "nndf_neg_risk_raw_best", "nndf_pos_risk_best", 
+    "nndf_prior_used_mean", "nndf_u_kept_frac_mean", "nndf_pu_loss_mean", "n_empty_batches_total",
     "train_seconds", "wall_seconds", "peak_vram_alloc_mb", "prereg_status", "cfg_hash", "meta_sha",
     "finished_utc", "error",
 ]
@@ -79,10 +77,13 @@ class RunSpec:
     lp: bool
     seed: int
     prior: float | None = None
+    variant: str | None = None
 
     @property
     def label(self) -> str:
-        return "oracle" if self.oracle else self.loss
+        if self.oracle:
+            return "oracle"
+        return self.loss if self.variant is None else f"{self.loss}_{self.variant}"
 
     @property
     def run_id(self) -> str:
@@ -91,7 +92,7 @@ class RunSpec:
 
 
 def build_plan(bench: Mapping[str, Any]) -> list[RunSpec]:
-    """Expand the benchmark spec into an ordered list of runs; duplicate run_ids are an error."""
+    """Expand groups, delays, losses, variants and seeds; reject duplicate run IDs."""
     seeds = [int(s) for s in bench["seeds"]]
     default_delays = list(bench["delays"])
     default_backbone = str(bench.get("backbone", "sage"))
@@ -105,6 +106,20 @@ def build_plan(bench: Mapping[str, Any]) -> list[RunSpec]:
         bad = [x for x in losses if x not in LOSSES]
         if bad:
             raise ValueError(f"group '{gname}': unknown loss {bad}; allowed {LOSSES}")
+        variant_map = g.get("variants") or {}
+        variants: list[str | None] = (
+            list(variant_map.keys()) if variant_map else [None]
+        )
+        if variant_map and (oracle or losses != ["tw_nndf"]):
+            raise ValueError(
+                f"group '{gname}': variants only make sense for "
+                "non-oracle losses == ['tw_nndf']"
+            )
+        if variant_map:
+            for vname, override in variant_map.items():
+                if not isinstance(override, Mapping):
+                    raise ValueError(f"group '{gname}': variant '{vname}' must be a mapping.")
+                    
         prior_map = g.get("priors_by_delay")
         for delay in g.get("delays", default_delays):
             priors: list[float | None] = [None] if prior_map is None else list(prior_map.get(delay, []))
@@ -112,15 +127,17 @@ def build_plan(bench: Mapping[str, Any]) -> list[RunSpec]:
                 for prior in priors:
                     if prior is not None and (loss != "tw_nndf" or oracle):
                         raise ValueError(f"group '{gname}': priors_by_delay only makes sense for tw_nndf")
-                    for seed in seeds:
-                        spec = RunSpec(group=gname, delay=delay, loss=loss, oracle=oracle,
-                                       backbone=str(g.get("backbone", default_backbone)),
-                                       use_temporal=bool(g.get("use_temporal", True)), lp=bool(g.get("lp", False)),
-                                       seed=seed, prior=None if prior is None else float(prior))
-                        if spec.run_id in seen:
-                            raise ValueError(f"duplicate run_id {spec.run_id} (group '{gname}')")
-                        seen.add(spec.run_id)
-                        plan.append(spec)
+                    
+                    for var in variants:
+                        for seed in seeds:
+                            spec = RunSpec(group=gname, delay=delay, loss=loss, oracle=oracle,
+                                           backbone=str(g.get("backbone", default_backbone)),
+                                           use_temporal=bool(g.get("use_temporal", True)), lp=bool(g.get("lp", False)),
+                                           seed=seed, prior=None if prior is None else float(prior), variant=var)
+                            if spec.run_id in seen:
+                                raise ValueError(f"duplicate run_id {spec.run_id} (group '{gname}')")
+                            seen.add(spec.run_id)
+                            plan.append(spec)
     return plan
 
 
@@ -138,6 +155,22 @@ def resolve_cfg(base_cfg: Mapping[str, Any], bench: Mapping[str, Any], spec: Run
         if lam is not None:
             d["lam"] = float(lam)
         loss_cfg["delay_ipw"] = d
+        
+    if spec.variant is not None:
+        try:
+            override = bench["groups"][spec.group]["variants"][spec.variant]
+        except KeyError as exc:
+            raise KeyError(
+                f"Cannot resolve variant '{spec.variant}' "
+                f"for group '{spec.group}'."
+            ) from exc
+        if spec.loss != "tw_nndf" or spec.oracle:
+            raise ValueError("Variants are supported only for non-oracle tw_nndf.")
+        loss_cfg = cfg.setdefault("loss", {})
+        tw_cfg = dict(loss_cfg.get("tw_nndf") or {})
+        tw_cfg.update(dict(override))
+        loss_cfg["tw_nndf"] = tw_cfg
+        
     return cfg
 
 
@@ -159,8 +192,12 @@ def apply_prior_override(plan: Sequence[RunSpec], prior: float) -> list[RunSpec]
 
 def hash_config(base_cfg: Mapping[str, Any], bench: Mapping[str, Any]) -> str:
     payload = {k: base_cfg.get(k) for k in HASHED_SECTIONS}
-    payload["lam_by_delay"] = bench.get("lam_by_delay")
-    payload["backbone"] = bench.get("backbone")
+    # Execution budget is not part of the scientific protocol.
+    protocol = {
+        k: v for k, v in bench.items()
+        if k not in ("max_hours",)
+    }
+    payload["benchmark_protocol"] = protocol
     return hashlib.sha256(json.dumps(jsonable(payload), sort_keys=True).encode()).hexdigest()[:12]
 
 
@@ -220,6 +257,7 @@ def _now_utc() -> str:
 def finalize_row(spec: RunSpec, res: Mapping[str, Any], *, wall: float, cfg_hash: str, meta_sha: str) -> dict[str, Any]:
     """run_one() row + benchmark fields + tw_nndf diagnostics at the best epoch (the model that is evaluated)."""
     row = dict(res["row"])
+    row["variant"] = spec.variant
     det = res["details"]
     info, hist = det.get("info", {}), det.get("fit", {}).get("history", [])
     row.update(run_id=spec.run_id, status="ok", group=spec.group, prior_override=spec.prior, wall_seconds=wall,
@@ -233,13 +271,22 @@ def finalize_row(spec: RunSpec, res: Mapping[str, Any], *, wall: float, cfg_hash
         row["nndf_pos_risk_best"] = h.get("nndf_pos_risk")
         row["nndf_clamped_mean"] = sum(float(x["nndf_clamped_rate"]) for x in hist) / len(hist)
         row["n_empty_batches_total"] = sum(float(x.get("n_empty_batches", 0.0)) for x in hist)
+        row["nndf_prior_used_mean"] = (
+            sum(float(x.get("nndf_prior_used", 0.0)) for x in hist) / len(hist)
+        )
+        row["nndf_u_kept_frac_mean"] = (
+            sum(float(x.get("nndf_u_kept_frac", 0.0)) for x in hist) / len(hist)
+        )
+        row["nndf_pu_loss_mean"] = (
+            sum(float(x.get("nndf_pu_loss", 0.0)) for x in hist) / len(hist)
+        )
     return row
 
 
 def failed_row(spec: RunSpec, exc: BaseException, *, wall: float, cfg_hash: str) -> dict[str, Any]:
     msg = f"{type(exc).__name__}: {exc}".replace("\n", " ")[:300]
     return {"run_id": spec.run_id, "status": "failed", "group": spec.group, "delay": spec.delay, "loss": spec.label,
-            "oracle": spec.oracle, "backbone": spec.backbone, "use_temporal": spec.use_temporal,
+            "variant": spec.variant, "oracle": spec.oracle, "backbone": spec.backbone, "use_temporal": spec.use_temporal,
             "lp_features": spec.lp, "seed": spec.seed, "prior_override": spec.prior, "wall_seconds": wall,
             "prereg_status": PREREG_STATUS, "cfg_hash": cfg_hash, "finished_utc": _now_utc(), "error": msg}
 

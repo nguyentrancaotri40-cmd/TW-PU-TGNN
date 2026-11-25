@@ -26,15 +26,12 @@ from src.losses.calibration import (
     MatureTemperatureTracker, SlidingWindowPrior, sliding_window_prior, unlabeled_prior, young_counts,
 )
 from src.losses.maturity_mask import MaturityMaskLoss
-from src.losses.tw_nndf import HybridTWnnDFLoss, TimeWindowNNDFLoss, estimate_class_prior
-from src.losses.tw_nndf import HybridTWnnDFLoss
+from src.losses.tw_nndf import HybridTWnnDFLoss, TimeWindowNNDFLoss
 from src.data.dataset import load_phase_datasets, read_meta, seed_labels
 from src.eval import metrics as M
 from src.graph.builder import PNU_CODES, TXN
-from src.losses.tw_nndf import HybridTWnnDFLoss, TimeWindowNNDFLoss
 from src.losses import (
-    NaiveBCELoss, TimeWindowNNDFLoss, build_loss, compute_age_days, estimate_class_prior,
-    lam_from_median_delay,
+    NaiveBCELoss, build_loss, compute_age_days, estimate_class_prior, lam_from_median_delay,
 )
 from src.losses import DelayIPWLoss
 from src.models.classifier import FraudClassifier, entity_vocab_sizes_from_meta
@@ -45,9 +42,15 @@ from src.train.utils import (
 
 LOSS_NAMES = ("naive_bce", "maturity_mask", "delay_ipw", "tw_nndf")
 MONITORS = ("pr_auc", "roc_auc", "recall_at_fpr")
-NNDF_KEYS = ("pos_risk", "neg_risk_raw", "clamped", "ascent", "bce")
+V2_KEYS = ("bce_pos_weight", "u_conf_filter", "u_conf_hi", "u_conf_lo")
+NNDF_KEYS = (
+    "pos_risk", "neg_risk_raw", "neg_risk", "clamped",
+    "ascent", "bce", "pu_loss", "prior_used",
+    "u_raw_count", "u_pu_count", "u_kept_count", "u_kept_frac",
+)
 PRIOR_MODES = ("mature_mean", "sliding_window", "sliding_unlabeled", "sliding_dynamic")
 AMOUNT_KEYS = ("amount_aware", "amount_quantile", "amount_min_age_days")
+
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -170,6 +173,8 @@ def build_training_loss(cfg: TrainConfig, train_ds: Any, meta: Mapping[str, Any]
         lambda_pu = float(params.pop("lambda_pu", 1.0))
         calib_cfg = dict(params.pop("calibration", None) or {})
         aw = {k: params.pop(k) for k in AMOUNT_KEYS if k in params}
+        v2 = {k: params.pop(k) for k in V2_KEYS if k in params}
+
         if prior_mode not in PRIOR_MODES:
             raise ValueError(f"prior_mode must be one of {PRIOR_MODES}.")
         if variant not in ("pu_only", "hybrid"):
@@ -177,16 +182,23 @@ def build_training_loss(cfg: TrainConfig, train_ds: Any, meta: Mapping[str, Any]
         if "unlabeled_statuses" in params:
             params["unlabeled_statuses"] = tuple(params["unlabeled_statuses"])
 
-        est = estimate_class_prior(full.y_obs, age_all, window, full.in_train_view)  # observed labels only
-        prior_auto = est
-        info.update(prior_estimated=est)
-        if prior_mode != "mature_mean":
-            sw = sliding_window_prior(full.y_obs, age_all, window, in_train_view=full.in_train_view,
-                                      span_days=span_days, n_windows=n_windows)
-            prior_auto = sw.prior  # sliding_dynamic uses it as the fallback scalar
-            info.update(prior_sliding=sw.prior, prior_window_rates=list(sw.window_rates),
-                        prior_window_counts=list(sw.window_counts))
-            if prior_mode == "sliding_unlabeled":
+        est = estimate_class_prior(full.y_obs, age_all, window, full.in_train_view)
+        prior_auto = float(est)
+        info.update(
+            prior_estimated=prior_auto,     
+        )
+
+        if prior_mode == "mature_mean":
+            prior_auto = prior_auto
+        elif prior_mode in ("sliding_window", "sliding_unlabeled"):
+            sw = sliding_window_prior(
+                full.y_obs, age_all, window, in_train_view=full.in_train_view,
+                span_days=span_days, n_windows=n_windows,
+            )
+            if prior_mode == "sliding_window":
+                prior_auto = float(sw.prior)
+                info.update(prior_window_rates=list(sw.window_rates), prior_window_counts=list(sw.window_counts))
+            else:
                 if tuple(params.get("unlabeled_statuses", ("U",))) != ("U",):
                     raise ValueError("prior_mode='sliding_unlabeled' needs unlabeled_statuses == ['U'].")
                 n_p, n_u = young_counts(full.pnu, age_all, window, full.in_train_view)
@@ -210,8 +222,11 @@ def build_training_loss(cfg: TrainConfig, train_ds: Any, meta: Mapping[str, Any]
             info.update(prior_dynamic_min=float(sp.table.min()), prior_dynamic_max=float(sp.table.max()))
         tracker = MatureTemperatureTracker(**calib_cfg) if bool(calib_cfg.pop("enabled", True)) else None
         info.update(lambda_pu=lambda_pu, calibration=tracker is not None)
+
+        info.update(**{f"v2_{k}": v for k, v in v2.items()})
         return HybridTWnnDFLoss(prior=prior, lambda_pu=lambda_pu, amount_threshold=thr,
-                                amount_min_age_days=min_age, calibrator=tracker, sliding_prior=sp, **params), info
+                                amount_min_age_days=min_age, calibrator=tracker, sliding_prior=sp,
+                                **v2, **params), info
 
     if cfg.loss == "delay_ipw":
         lam = params.pop("lam", None)
@@ -223,46 +238,42 @@ def build_training_loss(cfg: TrainConfig, train_ds: Any, meta: Mapping[str, Any]
     return build_loss(cfg.loss, **params), info
 
 
-def compute_batch_loss(
-    model: nn.Module, loss_fn: nn.Module, batch: Any, label_cut: float, oracle: bool
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Forward + loss on the seed rows of one batch (shared with scripts/profile_epoch.py)."""
-    labels = seed_labels(batch)
-    if oracle:
-        if "y_true" not in labels:
-            raise KeyError("Oracle run needs y_true in the train batches (expose_train_true_labels=True).")
-        y = labels["y_true"]
-    else:
-        y = labels["y_obs"]
-    age = compute_age_days(labels["time"], label_cut)
-    kwargs: dict[str, Any] = {"age_days": age, "in_train_view": labels["in_train_view"]}
-    if getattr(loss_fn, "needs_amount", False):  # amount-aware masking / cost-sensitive nnDF only
-        if "amount" not in labels:
-            raise KeyError("This loss needs `amount` in the batches.")
-        kwargs["amount"] = labels["amount"]
-    logits = model(batch)
-    loss = loss_fn(logits, y, labels["pnu"], **kwargs)
-    return loss, logits
-
-
 # --------------------------------------------------------------------------- #
 # One step / prediction
 # --------------------------------------------------------------------------- #
 def compute_batch_loss(
-    model: nn.Module, loss_fn: nn.Module, batch: Any, label_cut: float, oracle: bool
+    model: nn.Module,
+    loss_fn: nn.Module,
+    batch: Any,
+    label_cut: float,
+    oracle: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Forward + loss on the seed rows of one batch (shared with scripts/profile_epoch.py)."""
+    """Forward + loss on the seed rows of one batch."""
     labels = seed_labels(batch)
+
     if oracle:
         if "y_true" not in labels:
-            raise KeyError("Oracle run needs y_true in the train batches (expose_train_true_labels=True).")
+            raise KeyError(
+                "Oracle run needs y_true in the train batches "
+                "(expose_train_true_labels=True)."
+            )
         y = labels["y_true"]
     else:
         y = labels["y_obs"]
+
     age = compute_age_days(labels["time"], label_cut)
+    kwargs: dict[str, Any] = {
+        "age_days": age,
+        "in_train_view": labels["in_train_view"],
+    }
+
+    if getattr(loss_fn, "needs_amount", False):
+        if "amount" not in labels:
+            raise KeyError("This loss needs `amount` in the batches.")
+        kwargs["amount"] = labels["amount"]
+
     logits = model(batch)
-    extra = {"amount": labels["amount"]} if getattr(loss_fn, "needs_amount", False) else {}
-    loss = loss_fn(logits, y, labels["pnu"], age_days=age, in_train_view=labels["in_train_view"], **extra)
+    loss = loss_fn(logits, y, labels["pnu"], **kwargs)
     return loss, logits
 
 
@@ -311,6 +322,37 @@ class Trainer:
         self._is_nndf = isinstance(loss_fn, TimeWindowNNDFLoss)
 
     # ---- one epoch ---------------------------------------------------------- #
+    def _has_valid_pu_batch(
+    self, batch: Any, risks: Mapping[str, torch.Tensor] | None
+) -> bool:
+        """Whether this batch contributed a non-empty P/U objective after filtering."""
+        if risks is None:
+            return False
+        store = batch[TXN]
+        pnu_all = store.pnu.reshape(-1)
+        # Losses receive seed labels only (`seed_labels`); history nodes must not enter
+        # this batch-level P/U availability diagnostic.
+        batch_size = int(store.batch_size) if "batch_size" in store else pnu_all.numel()
+        pnu = pnu_all[:batch_size]
+        view_all = store.get("in_train_view")
+        if view_all is None:
+            view = torch.ones_like(pnu, dtype=torch.bool)
+        else:
+            view = view_all.reshape(-1).bool()[:batch_size]
+
+        has_p = bool((view & (pnu == PNU_CODES["P"])).any())
+        statuses = tuple(getattr(self.loss_fn, "unlabeled_statuses", ("U",)))
+        u_codes = torch.as_tensor(
+            [PNU_CODES[s] for s in statuses], dtype=pnu.dtype, device=pnu.device
+        )
+        has_u = bool((view & torch.isin(pnu, u_codes)).any())
+
+        # Hybrid loss reports the count remaining after trusted-U and confidence filtering.
+        if "u_kept_count" in risks:
+            has_u = float(risks["u_kept_count"]) > 0.0
+        return has_p and has_u
+
+    # ---- one epoch ---------------------------------------------------------- #
     def train_epoch(self) -> dict[str, float]:
         cfg, dev = self.cfg, self.device
         self.model.train()
@@ -319,6 +361,9 @@ class Trainer:
         loss_sum = torch.zeros((), device=dev)
         risk_sum = {k: torch.zeros((), device=dev) for k in NNDF_KEYS}
         n_used = n_empty = 0
+        nndf_batches = n_pu_valid_batches = 0
+        negative_risk_batches = nnpu_ascent_batches = zero_pu_batches = 0
+
         for step, batch in enumerate(self.train_ds):
             if cfg.max_train_batches is not None and step >= cfg.max_train_batches:
                 break
@@ -330,32 +375,75 @@ class Trainer:
 
             loss, _ = compute_batch_loss(self.model, self.loss_fn, batch, self.label_cut, cfg.oracle)
             self.opt.zero_grad(set_to_none=True)
-            if self._is_nndf and self.loss_fn.last_risks is None:  # no P or no U in this batch
+
+            risks = self.loss_fn.last_risks if self._is_nndf else None
+            if self._is_nndf:
+                nndf_batches += 1
+                if self._has_valid_pu_batch(batch, risks):
+                    n_pu_valid_batches += 1
+                    raw = risks.get("neg_risk_raw")
+                    ascent = risks.get("ascent")
+                    if raw is not None and float(raw) < 0.0:
+                        negative_risk_batches += 1
+                    if ascent is not None and float(ascent) > 0.0:
+                        nnpu_ascent_batches += 1
+                else:
+                    zero_pu_batches += 1
+
+            if self._is_nndf and risks is None:  # pu_only: no P or no U in this batch
                 n_empty += 1
                 continue
+
             loss.backward()
             if cfg.grad_clip is not None:
                 nn.utils.clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
             self.opt.step()
             loss_sum += loss.detach()
             n_used += 1
-            if self._is_nndf:  # tensors accumulated on device: no GPU sync per step
-                for k in NNDF_KEYS:
-                    risk_sum[k] += self.loss_fn.last_risks.get(k, loss_sum.new_zeros(())).to(dev)  # pu_only has no "bce"
-        elapsed = sw.stop()
 
+            if self._is_nndf and risks is not None:
+                for k in NNDF_KEYS:
+                    value = risks.get(k)
+                    if value is not None:
+                        risk_sum[k] += value.to(dev)
+
+        elapsed = sw.stop()
         denom = max(n_used, 1)
         mean_loss = float(loss_sum) / denom
         if not math.isfinite(mean_loss):
             raise FloatingPointError("Training loss is not finite: training diverged.")
-        out = {"train_loss": mean_loss, "n_steps": float(n_used), "n_empty_batches": float(n_empty),
-               "lr_end": float(self.opt.param_groups[0]["lr"]), "train_sec": elapsed}
+        out = {
+            "train_loss": mean_loss, "n_steps": float(n_used), "n_empty_batches": float(n_empty),
+            "lr_end": float(self.opt.param_groups[0]["lr"]), "train_sec": elapsed,
+        }
+
         if self._is_nndf:
-            out.update({"nndf_pos_risk": float(risk_sum["pos_risk"]) / denom,
-                        "nndf_neg_risk_raw": float(risk_sum["neg_risk_raw"]) / denom,
-                        "nndf_clamped_rate": float(risk_sum["clamped"]) / denom,
-                        "nndf_bce": float(risk_sum["bce"]) / denom,
-                        "nndf_ascent_rate": float(risk_sum["ascent"]) / denom})
+            valid_denom = max(n_pu_valid_batches, 1)
+            total_denom = max(nndf_batches, 1)
+            negative_risk_rate = negative_risk_batches / valid_denom
+            nnpu_ascent_rate = nnpu_ascent_batches / valid_denom
+            zero_pu_rate = zero_pu_batches / total_denom
+            out.update({
+                "nndf_pos_risk": float(risk_sum["pos_risk"]) / denom,
+                "nndf_neg_risk_raw": float(risk_sum["neg_risk_raw"]) / denom,
+                "nndf_neg_risk": float(risk_sum["neg_risk"]) / denom,
+                # `clamped` in the loss is only the event (negative raw risk), not necessarily
+                # an objective clamp: nnPU uses its ascent branch when raw < -beta.
+                "nndf_negative_risk_rate": negative_risk_rate,
+                "nndf_ascent_rate": nnpu_ascent_rate,
+                "nndf_zero_pu_rate": zero_pu_rate,
+                # Backward-compatible alias consumed by existing benchmark reporting.
+                "nndf_clamped_rate": negative_risk_rate,
+                "nndf_bce": float(risk_sum["bce"]) / denom,
+                "nndf_pu_loss": float(risk_sum["pu_loss"]) / denom,
+                "nndf_prior_used": float(risk_sum["prior_used"]) / denom,
+                "nndf_u_raw_count": float(risk_sum["u_raw_count"]) / denom,
+                "nndf_u_pu_count": float(risk_sum["u_pu_count"]) / denom,
+                "nndf_u_kept_count": float(risk_sum["u_kept_count"]) / denom,
+                "nndf_u_kept_frac": float(risk_sum["u_kept_frac"]) / denom,
+                "nndf_pu_valid_batches": float(n_pu_valid_batches),
+                "nndf_batches": float(nndf_batches),
+            })
         return out
 
     # ---- evaluation ---------------------------------------------------------- #
@@ -364,11 +452,29 @@ class Trainer:
         return M.summarize_scores(out["y_true"], out["scores"], fpr=self.cfg.fpr), out
 
     def evaluate_test(self, test_ds: Any, threshold: float) -> dict[str, float]:
-        """Score the test set ONCE with the threshold fitted on validation."""
-        m, out = self.evaluate(test_ds)
-        op = M.operating_point(out["y_true"], out["scores"], out["amount"], threshold,
-                               review_cost=self.cfg.review_cost)
-        return {**m, **{f"op_{k}": v for k, v in op.items()}}
+        """Evaluate test ranking metrics and apply ONLY the threshold fitted on validation.
+
+        Do not call ``self.evaluate`` here: ``summarize_scores`` also fits a threshold on the
+        supplied labels, which would make a test-set Recall@FPR an oracle operating point.
+        """
+        if math.isnan(float(threshold)):
+            raise ValueError("Validation threshold must not be NaN.")
+        out = predict(self.model, test_ds, self.device)
+        y_true, scores, amount = out["y_true"], out["scores"], out["amount"]
+        pr_auc = M.average_precision(y_true, scores)
+        roc = M.roc_auc(y_true, scores)
+        op = M.operating_point(
+            y_true, scores, amount, float(threshold), review_cost=self.cfg.review_cost
+        )
+        return {
+            "pr_auc": pr_auc,
+            "roc_auc": roc,
+            # This is Recall/FPR at the validation-fitted threshold, not a test-fitted threshold.
+            "recall_at_fpr": op["recall"],
+            "fpr_at_valthr": op["fpr"],
+            "val_threshold_applied": float(threshold),
+            **{f"op_{k}": v for k, v in op.items()},
+        }
 
     # ---- full training run ---------------------------------------------------- #
     def fit(self) -> dict[str, Any]:
@@ -400,9 +506,14 @@ class Trainer:
                                Path(cfg.save_dir) / "best.pt")
             history.append({"epoch": float(epoch), **tr, "val_pr_auc": va["pr_auc"],
                             "val_roc_auc": va["roc_auc"], "val_recall_at_fpr": va["recall_at_fpr"]})
-            extra = (f" | nndf neg_raw={tr['nndf_neg_risk_raw']:+.4f} clamped={tr['nndf_clamped_rate']:.2f}"
-                     f" ascent={tr['nndf_ascent_rate']:.2f} bce={tr['nndf_bce']:.4f} T={tr.get('calib_T', float('nan')):.3f}"
-                     f" empty={int(tr['n_empty_batches'])}") if self._is_nndf else ""
+            extra = (
+                f" | nndf neg_raw={tr['nndf_neg_risk_raw']:+.4f}"
+                f" negative_risk_rate={tr['nndf_negative_risk_rate']:.2f}"
+                f" ascent_rate={tr['nndf_ascent_rate']:.2f}"
+                f" zero_pu_rate={tr['nndf_zero_pu_rate']:.2f}"
+                f" bce={tr['nndf_bce']:.4f} T={tr.get('calib_T', float('nan')):.3f}"
+                f" empty={int(tr['n_empty_batches'])}"
+            ) if self._is_nndf else ""
             self.log(f"epoch {epoch:>2} loss={tr['train_loss']:.4f} val_prauc={va['pr_auc']:.4f} "
                      f"val_auc={va['roc_auc']:.4f} val_rec@fpr={va['recall_at_fpr']:.4f} "
                      f"{'*' if improved else ' '} ({tr['train_sec']:.0f}s){extra}")
@@ -488,7 +599,7 @@ def run_one(
         "best_epoch": fit["best_epoch"], "epochs_run": fit["epochs_run"],
         "val_pr_auc": fit["val"]["pr_auc"], "val_roc_auc": fit["val"]["roc_auc"],
         "test_pr_auc": test["pr_auc"], "test_roc_auc": test["roc_auc"],
-        "test_recall_at_fpr": test["recall_at_fpr"],            # own-curve recall at FPR <= fpr
+        "test_recall_at_fpr": test["recall_at_fpr"],            # recall at validation-fitted threshold
         "test_recall_at_valthr": test["op_recall"], "test_fpr_at_valthr": test["op_fpr"],
         "test_efl": test["op_efl"], "test_efl_ratio": test["op_efl_ratio"],
         "train_seconds": fit["train_seconds"],
